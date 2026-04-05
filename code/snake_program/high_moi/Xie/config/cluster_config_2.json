@@ -1,0 +1,69 @@
+{
+  "__default__": {
+    "partition": "xuanyao-hm",
+    "qos": "xuanyao",
+    "account": "pi-xuanyao",
+    "time": "00:20:00",
+    "mem": "2000",
+    "cpus": "1",
+    "nodes": "1",
+    "output": "logs/out/{rule}.out",
+    "error": "logs/err/{rule}.err"
+  },
+
+  "prepare_log_dir": {
+    "mem": "100"
+  },
+
+  "preprocess": {
+    "mem": "10G"
+  },
+
+  "split_grna_matrix": {
+    "mem": "5G"
+  },
+
+  "perturbation_gene_qc": {
+    "time": "0:25:00",
+    "mem": "4500",
+    "output":   "logs/out/{rule}.chunk_{wildcards.chunk}.out",
+    "error":    "logs/err/{rule}.chunk_{wildcards.chunk}.err"
+  },
+
+  "create_resampled_grna_matrix": {
+    "output":   "logs/out/{rule}.chunk_{wildcards.chunk}.out",
+    "error":    "logs/err/{rule}.chunk_{wildcards.chunk}.err",
+    "time": "00:40:00",
+    "mem": "15G"
+  },
+
+  "obtain_test_statistics": {
+    "mem": "50G",
+    "output":   "logs/out/{rule}.chunk_{wildcards.chunk}.out",
+    "error":    "logs/err/{rule}.chunk_{wildcards.chunk}.err"
+  },
+
+  "combine_test_statistics": {
+    "output":   "logs/out/{rule}.chunk_{wildcards.chunk}.out",
+    "error":    "logs/err/{rule}.chunk_{wildcards.chunk}.err",
+    "mem": "20G"
+  },
+
+  "max_combine_statistics": {
+    "output":   "logs/out/{rule}.chunk_{wildcards.chunk}.out",
+    "error":    "logs/err/{rule}.chunk_{wildcards.chunk}.err",
+    "mem": "5G"
+  },
+
+  "compute_p_value": {
+    "output":   "logs/out/{rule}.chunk_{wildcards.chunk}.out",
+    "error":    "logs/err/{rule}.chunk_{wildcards.chunk}.err",
+    "mem": "10G",
+    "time": "10:30:00"
+  },
+
+  "bind_all_p_value": {
+    "time": "00:15:00",
+    "mem": "3000"
+  }
+}

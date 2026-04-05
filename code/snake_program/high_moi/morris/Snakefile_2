@@ -1,0 +1,156 @@
+configfile: "config/config_2.yaml"
+dscp = config["description"]
+data_dir = config["data_dir"]
+n_guides = config["n_guides"]
+guide_to_analyze  = list(range(1, n_guides+1))
+
+
+rule all:
+    input:
+        expand("/project/xuanyao/jiaming/paper/output/{description}/p_values/geneset_p_value.rds", description=dscp),
+        expand("/project/xuanyao/jiaming/paper/output/{description}/p_values/genewise_p_value.rds", description=dscp)
+
+rule prepare_log_dir:
+  output:
+    "snakemake_benchmarks/{description}/.init"
+  shell:
+    """
+    mkdir -p snakemake_benchmarks/{wildcards.description} && touch snakemake_benchmarks/{wildcards.description}/.init
+    """
+
+rule preprocess:
+    input:
+        response = lambda wc: f"{data_dir}/response_matrix.rds",
+        grna = lambda wc: f"{data_dir}/union_grna_assignment_matrix.rds",
+        covariate = lambda wc: f"{data_dir}/log_covariate.rds",
+        covariate_full = lambda wc: f"{data_dir}/covariate_complete.rds",
+        benchdir = "snakemake_benchmarks/{description}/.init"
+    output:
+        response = "/project/xuanyao/jiaming/Getting_started/output/{description}/intermediate/response_matrix.rds",
+        grna = "/project/xuanyao/jiaming/Getting_started/output/{description}/intermediate/grna_matrix.rds",
+        covariate = "/project/xuanyao/jiaming/Getting_started/output/{description}/intermediate/covariate.rds",
+        grna_nrow = "/project/xuanyao/jiaming/Getting_started/output/{description}/intermediate/grna_nrow.txt"
+    params:
+        cell_filter = config["cell_filter"],
+        filter_type = config["filter_type"],
+        filter_umi_cutoff = config["filter_umi_cutoff"],
+        filter_percentage = config["filter_percentage"],
+        rank = config["rank"],
+        grna_to_analyze= guide_to_analyze
+    benchmark:
+        "snakemake_benchmarks/{description}/preprocess.txt"
+
+    script:
+        "../../scripts/preprocess_morris.R"
+
+
+rule split_grna_matrix:
+    input:
+        grna = "/project/xuanyao/jiaming/Getting_started/output/{description}/intermediate/grna_matrix.rds"
+    output:
+        grna_chunks = expand(
+        "/project/xuanyao/jiaming/Getting_started/output/{{description}}/single_guide/grna_id_{chunk}.rds",
+        chunk=guide_to_analyze
+        )
+    benchmark:
+        "snakemake_benchmarks/{description}/split_grna_matrix.txt"
+    script:
+        "../../scripts/split_grna_matrix.R"
+
+rule perturbation_gene_qc:
+    input:
+        chunk = "/project/xuanyao/jiaming/Getting_started/output/{description}/single_guide/grna_id_{chunk}.rds",
+        grna_target_dataframe = lambda wc: f"{config['data_dir']}/grna_target_data_frame.rds",
+        gene_module_index_matrix = lambda wc: f"{config['data_dir']}/gene_module_index_matrix.rds",
+        discovery_pairs_cis = lambda wc: f"{config['data_dir']}/discovery_pairs_cis.rds",
+        response_matrix = "/project/xuanyao/jiaming/Getting_started/output/{description}/intermediate/response_matrix.rds"
+    output:
+        modified = "/project/xuanyao/jiaming/Getting_started/output/{description}/single_guide/gene_module_index_matrix_{chunk}.rds"
+    params:
+        trt_cells_cutoff = config["trt_cells_cutoff"],
+        control_cells_cutoff = config["control_cells_cutoff"],
+        guide_or_target = config["guide_or_target"]
+    benchmark:
+        "snakemake_benchmarks/{description}/perturbation_gene_qc_{chunk}.txt"
+
+    script:
+        "../../scripts/perturbation_gene_qc.R"
+
+rule create_resampled_grna_matrix:
+    input:
+        chunk = "/project/xuanyao/jiaming/Getting_started/output/{description}/single_guide/grna_id_{chunk}.rds",
+        covariate = "/project/xuanyao/jiaming/Getting_started/output/{description}/intermediate/covariate.rds"
+    params:
+        n_permute=config["n_permute"],
+        use_resample=config["use_resample"]
+    output:
+        resampled_grna_matrix = temp("/project/xuanyao/jiaming/Getting_started/output/{description}/single_guide/resampled_grna_id_{chunk}.rds")
+    benchmark:
+        "snakemake_benchmarks/{description}/create_resampled_grna_matrix_{chunk}.txt"
+    script:
+        "../../scripts/generate_resampled_grna_matrix.R"
+
+rule obtain_test_statistics:
+    input:
+        chunk = "/project/xuanyao/jiaming/Getting_started/output/{description}/single_guide/resampled_grna_id_{chunk}.rds",
+        guide = "/project/xuanyao/jiaming/Getting_started/output/{description}/single_guide/grna_id_{chunk}.rds",
+        response_matrix = "/project/xuanyao/jiaming/Getting_started/output/{description}/intermediate/response_matrix.rds"
+    params:
+        n_permute = config["n_permute"],
+        test_type = config["test_type"]
+    output:
+        normalized_test_result = temp("/project/xuanyao/jiaming/Getting_started/output/{description}/test_statistics/normalized_test_statistics_grna_id_{chunk}.rds")
+    benchmark:
+        "snakemake_benchmarks/{description}/obtain_test_statistics_{chunk}.txt"
+
+    script:
+        "../../scripts/obtain_test_statistics.R"
+
+rule combine_test_statistics:
+    input:
+        normalized_test_result = "/project/xuanyao/jiaming/Getting_started/output/{description}/test_statistics/normalized_test_statistics_grna_id_{chunk}.rds",
+        gene_module_index_matrix = "/project/xuanyao/jiaming/Getting_started/output/{description}/single_guide/gene_module_index_matrix_{chunk}.rds"
+    params:
+        advanced = config["advanced"]
+
+    benchmark:
+        "snakemake_benchmarks/{description}/combine_test_statistics_{chunk}.txt"
+    output:
+        combined_test_result = temp("/project/xuanyao/jiaming/Getting_started/output/{description}/test_statistics/combined_test_statistics_grna_id_{chunk}.rds")
+    script:
+        "../../scripts/combine_test_statistics.R"
+
+
+rule compute_p_value:
+    input:
+        combined_test_statistics = "/project/xuanyao/jiaming/Getting_started/output/{description}/test_statistics/combined_test_statistics_grna_id_{chunk}.rds",
+        normalized_test_tensor = "/project/xuanyao/jiaming/Getting_started/output/{description}/test_statistics/normalized_test_statistics_grna_id_{chunk}.rds",
+        gene_module_index_matrix = "/project/xuanyao/jiaming/Getting_started/output/{description}/single_guide/gene_module_index_matrix_{chunk}.rds",
+        guide = "/project/xuanyao/jiaming/Getting_started/output/{description}/single_guide/grna_id_{chunk}.rds"
+    output:
+        geneset_p_value = temp("/project/xuanyao/jiaming/Getting_started/output/{description}/p_values/geneset_p_value_grna_id_{chunk}.rds"),
+        genewise_p_value = temp("/project/xuanyao/jiaming/Getting_started/output/{description}/p_values/genewise_p_value_grna_id_{chunk}.rds")
+    benchmark:
+        "snakemake_benchmarks/{description}/compute_p_value_{chunk}.txt"
+    params:
+        n_permute = config["n_permute"],
+        use_approximation = config["use_approximation"],
+        use_approximation_gene = config["use_approximation_gene"],
+        approximation_type = config["approximation_type"],
+        approximation_threshold = config["approximation_threshold"]
+    script:
+        "../../scripts/compute_p_ACAT.R"
+
+rule bind_all_p_value:
+    input:
+        geneset_files = expand("/project/xuanyao/jiaming/Getting_started/output/{{description}}/p_values/geneset_p_value_grna_id_{chunk}.rds",
+                          chunk=guide_to_analyze),
+        genewise_files = expand("/project/xuanyao/jiaming/Getting_started/output/{{description}}/p_values/genewise_p_value_grna_id_{chunk}.rds",
+                           chunk=guide_to_analyze)
+    output:
+        geneset_merged = "/project/xuanyao/jiaming/paper/output/{description}/p_values/geneset_p_value.rds",
+        genewise_merged = "/project/xuanyao/jiaming/paper/output/{description}/p_values/genewise_p_value.rds"
+    benchmark:
+        "snakemake_benchmarks/{description}/bind_all_p_value.txt"
+    script:
+        "../../scripts/bind_all_p_value.R"

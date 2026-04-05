@@ -1,0 +1,75 @@
+---
+title: "topic_model"
+output: html_document
+date: "2026-01-02"
+---
+
+
+# Asthma
+
+"/project/xuanyao/jiaming/Getting_started/data/Nadig/topic_de/de_15_0.05_2.5_0.5/gene_set_K15.rds"
+
+```{r}
+get_de_genes <- function(de, k,
+                         lfsr_thr = 0.05,
+                         z_thr    = 2.5,
+                         fc_thr   = 0.5,
+                         gene_names) {
+
+  z_k     <- de$z[, k]
+  lfsr_k  <- de$lfsr[, k]
+  beta_k  <- de$postmean[, k]   
+
+  # 先去掉 NA
+  ok <- !is.na(z_k) & !is.na(lfsr_k) & !is.na(beta_k)
+
+  idx <- which(
+    ok &
+      lfsr_k <= lfsr_thr &      # 置信度高
+      abs(z_k)   >= z_thr &     # z 比较大
+      abs(beta_k) >= fc_thr     # fold change 比较大
+  )
+
+  gene_names[idx]
+}
+
+response_subset_tmp <- readRDS("/project/xuanyao/jiaming/Getting_started/data/Nadig/response_subset_tmp.rds")
+gene_names<-rownames(response_subset_tmp)
+
+
+
+de <- readRDS("/project/xuanyao/jiaming/Getting_started/data/Nadig/topic_model_1000_iter/de_15.rds")
+
+
+
+
+de_genes_list <- lapply(seq_len(ncol(de$z)),
+                        function(k) get_de_genes(de, k,gene_names=gene_names))
+names(de_genes_list) <- paste0("k", seq_len(ncol(de$z)))
+
+filtered_list<- Filter(function(x) length(x) > 5, de_genes_list)
+
+```
+
+
+# MCH
+"/project/xuanyao/jiaming/Getting_started/data/repologle/topic_model/K100/gene_set_K100.rds"
+
+
+```{r}
+
+MCH_perturbed_expression_matrix <- readRDS("/project/xuanyao/jiaming/Getting_started/data/repologle/topic_model/MCH_perturbed_expression_matrix.rds")
+gene_names<-rownames(MCH_perturbed_expression_matrix)
+
+
+de <- readRDS("/project/xuanyao/jiaming/Getting_started/data/repologle/topic_model/K100/de_100.rds")
+
+
+
+de_genes_list <- lapply(seq_len(ncol(de$z)),
+                        function(k) get_de_genes(de, k,gene_names=gene_names))
+names(de_genes_list) <- paste0("k", seq_len(ncol(de$z)))
+
+filtered_list <- Filter(function(x) length(x) > 5, de_genes_list)
+```
+

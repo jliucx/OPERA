@@ -1,0 +1,21 @@
+n_permute: 3000
+use_resample: true
+use_approximation: true
+use_approximation_gene: false
+approximation_type: "t"
+test_type: "wilcoxon_test"
+moi: "high"
+data_dir: "/project/xuanyao/jiaming/Getting_started/data/Xie/program_data"
+description: "snake/Xie_Hallmark/3000_t_ACAT_default_union_"
+cell_filter: true
+filter_type: "quantile"
+filter_umi_cutoff: 5000
+filter_percentage: 0.01
+rank: false
+trt_cells_cutoff: 7
+control_cells_cutoff: 7
+advanced: false
+approximation_threshold: 0.05
+n_guides: 522
+guide_or_target: "target"
+

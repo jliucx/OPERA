@@ -1,0 +1,655 @@
+---
+title: "flames_200kb_mapping"
+output: html_document
+date: "2026-03-20"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# asthma
+
+## flames/200kb
+
+```{r}
+library(data.table)
+sigsnps<-fread("/project/xuanyao/jiaming/Getting_started/data/GWAS/asthma/GCST010043/GCST010043_associations_export.tsv")
+sigsnps
+
+
+
+flames_scores<-read.table("/project/xuanyao/jiaming/Getting_started/data/FLAMES/asthma/flames_new/flames_final_score/FLAMES_scores.pred", header=TRUE, sep="\t")
+
+
+library(dplyr)
+library(purrr)
+
+# 1. 提取 sigsnps 的 rsid（去掉等位基因后缀）
+sigsnps <- sigsnps %>%
+  mutate(rsid = sub("-[^-]+$", "", riskAllele))
+
+# 2. 读取所有 flames_cs/*.tsv，记录 rsid → cs文件名
+cs_dir <- "/project/xuanyao/jiaming/Getting_started/data/FLAMES/asthma/flames_new/flames_cs"
+cs_files <- list.files(cs_dir, pattern = "\\.tsv$", full.names = TRUE)
+
+cs_snp_map <- map_dfr(cs_files, function(f) {
+  df <- read.table(f, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+  if (!"indSigSNPs_str" %in% colnames(df)) return(NULL)
+  snps <- trimws(unlist(strsplit(df$indSigSNPs_str, ";")))  # 改这里
+  snps <- unique(snps)
+  data.frame(rsid = snps, cs_file = basename(f), stringsAsFactors = FALSE)
+})
+
+# 3. FLAMES_scores.pred 提取 cs文件名（从路径中）
+
+flames <- flames_scores  # 你的 FLAMES_scores.pred 读入的df
+flames <- flames %>%
+  mutate(cs_file = sub("\\.annot\\.txt$", "", basename(filename)))
+sigsnps_coords <- sigsnps %>% dplyr::select(riskAllele, rsid, locations)
+
+flames <- flames %>%
+  mutate(cs_file = sub("^FLAMES_annotated_", "", basename(filename)))
+# 4. 匹配：sigsnps rsid → cs_file → gene
+result <- sigsnps %>%
+  left_join(cs_snp_map, by = "rsid") %>%
+  left_join(flames %>% dplyr::select(cs_file, symbol, ensg), by = "cs_file") %>%
+  dplyr::select(riskAllele, rsid, cs_file, symbol, ensg)
+result <- result %>% left_join(sigsnps_coords, by = c("riskAllele", "rsid"))%>%
+  dplyr::distinct(riskAllele, rsid, symbol, ensg, locations, .keep_all = FALSE)
+result
+
+library(rtracklayer)
+
+# 1. 读取GTF（只读gene行，省内存）
+gtf <- rtracklayer::import("/project/xuanyao/jiaming/Getting_started/data/protein_coding_genes/Homo_sapiens.GRCh38.112.gtf.gz", 
+                            feature.type = "gene")
+gtf_df <- as.data.frame(gtf)
+gtf_df <- gtf_df[, c("seqnames", "start", "end", "gene_id", "gene_name")]
+colnames(gtf_df) <- c("chr", "start", "end", "ensg", "symbol")
+gtf_df$chr <- as.character(gtf_df$chr)
+
+# 2. 对unmapped SNP查200kb窗口
+
+rsid_with_flames <- result %>%
+  filter(!is.na(ensg)) %>%
+  pull(rsid) %>%
+  unique()
+
+# 只对完全没有 FLAMES 基因的 rsid 做 200kb
+unmapped <- result %>%
+  filter(!rsid %in% rsid_with_flames) %>%
+  distinct(riskAllele, rsid, locations) %>%
+  mutate(
+    chr   = sub(":.*", "", locations),
+    pos   = as.integer(sub(".*:", "", locations)),
+    start = pos - 100000,
+    end   = pos + 100000
+  )
+
+cat("完全没有 FLAMES 匹配的 rsid 数量:", nrow(unmapped), "\n")
+
+gene_window <- map_dfr(seq_len(nrow(unmapped)), function(i) {
+  row <- unmapped[i, ]
+  hits <- gtf_df %>%
+    filter(chr == row$chr,
+           end  >= row$start,
+           start <= row$end)
+  if (nrow(hits) == 0) return(NULL)
+  hits %>%
+    mutate(riskAllele = row$riskAllele,
+           rsid       = row$rsid,
+           cs_file    = NA_character_,
+           source     = "200kb_window",
+           locations  = row$locations) %>%
+    dplyr::select(riskAllele, rsid, cs_file, symbol, ensg, source, locations)
+})
+
+result_final <- result %>%
+  filter(!is.na(ensg)) %>%
+  mutate(source = "FLAMES") %>%
+  bind_rows(gene_window) %>%
+  distinct(riskAllele, rsid, symbol, ensg, source, .keep_all = TRUE)
+
+# 验证：应为 0
+cat("同时有两种来源的 rsid 数:\n")
+result_final %>%
+  group_by(rsid) %>%
+  summarise(n = n_distinct(source), .groups = "drop") %>%
+  filter(n > 1) %>%
+  nrow() %>%
+  cat("\n")
+
+result_final
+```
+
+```{r}
+table(result_final$source)
+result_final %>%
+  distinct(rsid, source) %>%
+  count(source)
+
+```
+
+
+## flames+200kb
+
+```{r}
+library(data.table)
+sigsnps<-fread("/project/xuanyao/jiaming/Getting_started/data/GWAS/asthma/GCST010043/GCST010043_associations_export.tsv")
+sigsnps
+flames_scores<-read.table("/project/xuanyao/jiaming/Getting_started/data/FLAMES/asthma/flames_new/flames_final_score/FLAMES_scores.pred", header=TRUE, sep="\t")
+library(dplyr)
+library(purrr)
+
+# 1. 提取 sigsnps 的 rsid（去掉等位基因后缀）
+sigsnps <- sigsnps %>%
+  mutate(rsid = sub("-[^-]+$", "", riskAllele))
+
+# 2. 读取所有 flames_cs/*.tsv，记录 rsid → cs文件名
+cs_dir <- "/project/xuanyao/jiaming/Getting_started/data/FLAMES/asthma/flames_new/flames_cs"
+cs_files <- list.files(cs_dir, pattern = "\\.tsv$", full.names = TRUE)
+cs_snp_map <- map_dfr(cs_files, function(f) {
+  df <- read.table(f, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+  if (!"indSigSNPs_str" %in% colnames(df)) return(NULL)
+  snps <- trimws(unlist(strsplit(df$indSigSNPs_str, ";")))
+  snps <- unique(snps)
+  data.frame(rsid = snps, cs_file = basename(f), stringsAsFactors = FALSE)
+})
+
+# 3. FLAMES_scores.pred 提取 cs文件名（从路径中）
+flames <- flames_scores
+flames <- flames %>%
+  mutate(cs_file = sub("\\.annot\\.txt$", "", basename(filename)))
+sigsnps_coords <- sigsnps %>% dplyr::select(riskAllele, rsid, locations)
+flames <- flames %>%
+  mutate(cs_file = sub("^FLAMES_annotated_", "", basename(filename)))
+
+# 4. 匹配：sigsnps rsid → cs_file → gene（FLAMES结果）
+result <- sigsnps %>%
+  left_join(cs_snp_map, by = "rsid") %>%
+  left_join(flames %>% dplyr::select(cs_file, symbol, ensg), by = "cs_file") %>%
+  dplyr::select(riskAllele, rsid, cs_file, symbol, ensg)
+result <- result %>% 
+  left_join(sigsnps_coords, by = c("riskAllele", "rsid")) %>%
+  dplyr::distinct(riskAllele, rsid, symbol, ensg, locations, .keep_all = FALSE)
+
+library(rtracklayer)
+
+# 5. 读取GTF
+gtf <- rtracklayer::import("/project/xuanyao/jiaming/Getting_started/data/protein_coding_genes/Homo_sapiens.GRCh38.112.gtf.gz", 
+                            feature.type = "gene")
+gtf_df <- as.data.frame(gtf)
+gtf_df <- gtf_df[, c("seqnames", "start", "end", "gene_id", "gene_name")]
+colnames(gtf_df) <- c("chr", "start", "end", "ensg", "symbol")
+gtf_df$chr <- as.character(gtf_df$chr)
+
+# 6. 对【所有】loci 做 200kb window 查询
+all_loci <- sigsnps_coords %>%
+  distinct(riskAllele, rsid, locations) %>%
+  mutate(
+    chr   = sub(":.*", "", locations),
+    pos   = as.integer(sub(".*:", "", locations)),
+    win_start = pos - 100000,
+    win_end   = pos + 100000
+  )
+
+cat("总 loci 数量:", nrow(all_loci), "\n")
+
+gene_window <- map_dfr(seq_len(nrow(all_loci)), function(i) {
+  row <- all_loci[i, ]
+  hits <- gtf_df %>%
+    filter(chr == row$chr,
+           end  >= row$win_start,
+           start <= row$win_end)
+  if (nrow(hits) == 0) return(NULL)
+  hits %>%
+    mutate(riskAllele = row$riskAllele,
+           rsid       = row$rsid,
+           cs_file    = NA_character_,
+           source     = "200kb_window",
+           locations  = row$locations) %>%
+    dplyr::select(riskAllele, rsid, cs_file, symbol, ensg, source, locations)
+})
+
+# 7. FLAMES 结果加 source 标记
+flames_result <- result %>%
+  filter(!is.na(ensg)) %>%
+  mutate(source = "FLAMES")
+
+# 8. 取并集：FLAMES ∪ 200kb_window
+result_final <- bind_rows(flames_result, gene_window) %>%
+  distinct(riskAllele, rsid, symbol, ensg, source, .keep_all = TRUE)
+
+# 统计
+cat("FLAMES 来源条目数:", nrow(flames_result), "\n")
+cat("200kb window 来源条目数:", nrow(gene_window), "\n")
+cat("并集总条目数:", nrow(result_final), "\n")
+
+# 同一 rsid+gene 同时被两种方法找到的数量
+overlap <- result_final %>%
+  group_by(rsid, symbol, ensg) %>%
+  summarise(n_source = n_distinct(source), .groups = "drop") %>%
+  filter(n_source > 1)
+cat("同时被 FLAMES 和 200kb window 找到的 rsid-gene 对数:", nrow(overlap), "\n")
+
+result_final
+```
+
+```{r}
+table(result_final$source)
+result_final %>%
+  distinct(rsid, source) %>%
+  count(source)
+```
+
+
+
+
+# MCH
+
+## flames/200kb
+
+
+```{r}
+library(data.table)
+sigsnps<-fread("/project/xuanyao/jiaming/Getting_started/data/GWAS/MCH/MCH_grch38.tsv")
+sigsnps
+
+
+
+flames_scores<-read.table("/project/xuanyao/jiaming/Getting_started/data/FLAMES/MCH/flames/flames_out/FLAMES_scores.pred", header=TRUE, sep="\t")
+
+
+library(dplyr)
+library(purrr)
+
+# 1. 提取 sigsnps 的 rsid（去掉等位基因后缀）
+sigsnps <- sigsnps %>%
+  mutate(rsid = sub("-[^-]+$", "", riskAllele))
+
+# 2. 读取所有 flames_cs/*.tsv，记录 rsid → cs文件名
+cs_dir <- "/project/xuanyao/jiaming/Getting_started/data/FLAMES/MCH/flames/flames_cs"
+cs_files <- list.files(cs_dir, pattern = "\\.tsv$", full.names = TRUE)
+
+cs_snp_map <- map_dfr(cs_files, function(f) {
+  df <- read.table(f, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+  if (!"indSigSNPs_str" %in% colnames(df)) return(NULL)
+  snps <- trimws(unlist(strsplit(df$indSigSNPs_str, ";")))  # 改这里
+  snps <- unique(snps)
+  data.frame(rsid = snps, cs_file = basename(f), stringsAsFactors = FALSE)
+})
+
+# 3. FLAMES_scores.pred 提取 cs文件名（从路径中）
+
+flames <- flames_scores  # 你的 FLAMES_scores.pred 读入的df
+flames <- flames %>%
+  mutate(cs_file = sub("\\.annot\\.txt$", "", basename(filename)))
+sigsnps_coords <- sigsnps %>% dplyr::select(riskAllele, rsid, locations)
+# 4. 匹配：sigsnps rsid → cs_file → gene
+result <- sigsnps %>%
+  left_join(cs_snp_map, by = "rsid") %>%
+  left_join(flames %>% dplyr::select(cs_file, symbol, ensg), by = "cs_file") %>%
+  dplyr::select(riskAllele, rsid, cs_file, symbol, ensg)
+result <- result %>% left_join(sigsnps_coords, by = c("riskAllele", "rsid"))%>%
+  dplyr::distinct(riskAllele, rsid, symbol, ensg, locations, .keep_all = FALSE)
+result
+
+library(rtracklayer)
+
+# 1. 读取GTF（只读gene行，省内存）
+gtf <- rtracklayer::import("/project/xuanyao/jiaming/Getting_started/data/protein_coding_genes/Homo_sapiens.GRCh38.112.gtf.gz", 
+                            feature.type = "gene")
+gtf_df <- as.data.frame(gtf)
+gtf_df <- gtf_df[, c("seqnames", "start", "end", "gene_id", "gene_name")]
+colnames(gtf_df) <- c("chr", "start", "end", "ensg", "symbol")
+gtf_df$chr <- as.character(gtf_df$chr)
+
+# 2. 对unmapped SNP查200kb窗口
+
+rsid_with_flames <- result %>%
+  filter(!is.na(ensg)) %>%
+  pull(rsid) %>%
+  unique()
+
+# 只对完全没有 FLAMES 基因的 rsid 做 200kb
+unmapped <- result %>%
+  filter(!rsid %in% rsid_with_flames) %>%
+  distinct(riskAllele, rsid, locations) %>%
+  mutate(
+    chr   = sub(":.*", "", locations),
+    pos   = as.integer(sub(".*:", "", locations)),
+    start = pos - 100000,
+    end   = pos + 100000
+  )
+
+cat("完全没有 FLAMES 匹配的 rsid 数量:", nrow(unmapped), "\n")
+
+gene_window <- map_dfr(seq_len(nrow(unmapped)), function(i) {
+  row <- unmapped[i, ]
+  hits <- gtf_df %>%
+    filter(chr == row$chr,
+           end  >= row$start,
+           start <= row$end)
+  if (nrow(hits) == 0) return(NULL)
+  hits %>%
+    mutate(riskAllele = row$riskAllele,
+           rsid       = row$rsid,
+           cs_file    = NA_character_,
+           source     = "200kb_window",
+           locations  = row$locations) %>%
+    dplyr::select(riskAllele, rsid, cs_file, symbol, ensg, source, locations)
+})
+
+result_final <- result %>%
+  filter(!is.na(ensg)) %>%
+  mutate(source = "FLAMES") %>%
+  bind_rows(gene_window) %>%
+  distinct(riskAllele, rsid, symbol, ensg, source, .keep_all = TRUE)
+
+# 验证：应为 0
+cat("同时有两种来源的 rsid 数:\n")
+result_final %>%
+  group_by(rsid) %>%
+  summarise(n = n_distinct(source), .groups = "drop") %>%
+  filter(n > 1) %>%
+  nrow() %>%
+  cat("\n")
+result_final
+```
+
+
+```{r}
+table(result_final$source)
+result_final %>%
+  distinct(rsid, source) %>%
+  count(source)
+```
+
+
+## flames+200kb
+
+```{r}
+library(data.table)
+sigsnps <- fread("/project/xuanyao/jiaming/Getting_started/data/GWAS/MCH/MCH_grch38.tsv")
+flames_scores <- read.table("/project/xuanyao/jiaming/Getting_started/data/FLAMES/MCH/flames/flames_out/FLAMES_scores.pred", header=TRUE, sep="\t")
+library(dplyr)
+library(purrr)
+
+# 1. 提取 sigsnps 的 rsid
+sigsnps <- sigsnps %>%
+  mutate(rsid = sub("-[^-]+$", "", riskAllele))
+
+# 2. 读取所有 flames_cs/*.tsv，记录 rsid → cs文件名
+cs_dir <- "/project/xuanyao/jiaming/Getting_started/data/FLAMES/MCH/flames/flames_cs"
+cs_files <- list.files(cs_dir, pattern = "\\.tsv$", full.names = TRUE)
+cs_snp_map <- map_dfr(cs_files, function(f) {
+  df <- read.table(f, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+  if (!"indSigSNPs_str" %in% colnames(df)) return(NULL)
+  snps <- trimws(unlist(strsplit(df$indSigSNPs_str, ";")))
+  snps <- unique(snps)
+  data.frame(rsid = snps, cs_file = basename(f), stringsAsFactors = FALSE)
+})
+
+# 3. 提取 cs_file 名
+flames <- flames_scores %>%
+  mutate(cs_file = sub("\\.annot\\.txt$", "", basename(filename)))
+
+sigsnps_coords <- sigsnps %>% dplyr::select(riskAllele, rsid, locations)
+
+# 4. FLAMES 匹配结果
+result <- sigsnps %>%
+  left_join(cs_snp_map, by = "rsid") %>%
+  left_join(flames %>% dplyr::select(cs_file, symbol, ensg), by = "cs_file") %>%
+  dplyr::select(riskAllele, rsid, cs_file, symbol, ensg) %>%
+  left_join(sigsnps_coords, by = c("riskAllele", "rsid")) %>%
+  dplyr::distinct(riskAllele, rsid, symbol, ensg, locations, .keep_all = FALSE)
+
+library(rtracklayer)
+
+# 5. 读取 GTF
+gtf <- rtracklayer::import("/project/xuanyao/jiaming/Getting_started/data/protein_coding_genes/Homo_sapiens.GRCh38.112.gtf.gz",
+                            feature.type = "gene")
+gtf_df <- as.data.frame(gtf)[, c("seqnames", "start", "end", "gene_id", "gene_name")]
+colnames(gtf_df) <- c("chr", "start", "end", "ensg", "symbol")
+gtf_df$chr <- as.character(gtf_df$chr)
+
+# 6. 对【所有】loci 做 200kb window
+all_loci <- sigsnps_coords %>%
+  distinct(riskAllele, rsid, locations) %>%
+  mutate(
+    chr      = sub(":.*", "", locations),
+    pos      = as.integer(sub(".*:", "", locations)),
+    win_start = pos - 100000,
+    win_end   = pos + 100000
+  )
+
+cat("总 loci 数量:", nrow(all_loci), "\n")
+
+gene_window <- map_dfr(seq_len(nrow(all_loci)), function(i) {
+  row <- all_loci[i, ]
+  hits <- gtf_df %>%
+    filter(chr == row$chr,
+           end  >= row$win_start,
+           start <= row$win_end)
+  if (nrow(hits) == 0) return(NULL)
+  hits %>%
+    mutate(riskAllele = row$riskAllele,
+           rsid       = row$rsid,
+           cs_file    = NA_character_,
+           source     = "200kb_window",
+           locations  = row$locations) %>%
+    dplyr::select(riskAllele, rsid, cs_file, symbol, ensg, source, locations)
+})
+
+# 7. FLAMES 结果加 source 标记
+flames_result <- result %>%
+  filter(!is.na(ensg)) %>%
+  mutate(source = "FLAMES")
+
+# 8. 并集
+result_final <- bind_rows(flames_result, gene_window) %>%
+  distinct(riskAllele, rsid, symbol, ensg, source, .keep_all = TRUE)
+
+# 统计
+cat("FLAMES 来源条目数:", nrow(flames_result), "\n")
+cat("200kb window 来源条目数:", nrow(gene_window), "\n")
+cat("并集总条目数:", nrow(result_final), "\n")
+
+overlap <- result_final %>%
+  group_by(rsid, symbol, ensg) %>%
+  summarise(n_source = n_distinct(source), .groups = "drop") %>%
+  filter(n_source > 1)
+cat("同时被两种方法找到的 rsid-gene 对数:", nrow(overlap), "\n")
+
+result_final
+```
+
+
+
+
+
+```{r}
+table(result_final$source)
+result_final %>%
+  distinct(rsid, source) %>%
+  count(source)
+```
+
+
+```{r}
+mch_gwas_genes<-result_final$ensg
+mch_gwas_genes <- paste0("gRNA:", result_final$ensg)
+```
+
+
+
+
+```{r}
+# ── 测试版 ────────────────────────────────────────────────────
+setwd("/project/xuanyao/jiaming/Getting_started")
+
+suppressPackageStartupMessages({
+  library(sceptre)
+  library(readr)
+  library(dplyr)
+  library(Matrix)
+  library(ondisc)
+})
+
+sceptre_obj <- read_ondisc_backed_sceptre_object(
+  sceptre_object_fp = "/project/xuanyao/zining/data/perturb_seq/cd4_perturb_seq/Stim8hr_merged_sgRNA/sceptre_object_donor_only.rds",
+  response_odm_file_fp = "/project/xuanyao/zining/data/perturb_seq/cd4_perturb_seq/Stim8hr_merged_sgRNA/gene.odm",
+  grna_odm_file_fp = "/project/xuanyao/zining/data/perturb_seq/cd4_perturb_seq/Stim8hr_merged_sgRNA/grna.odm")
+
+print("construct sceptre object success!")
+
+# ── 1. 读取 & 匹配 ─────────────────────────────────────────────
+Repologle_associated_genes <- readRDS(
+  "/project/xuanyao/jiaming/Getting_started/data/GWAS/asthma/GCST010043/flames+200kb/CDT4_associated_perturbation.rds")
+
+grna_names     <- rownames(sceptre_obj@grna_matrix[[1]])
+covariate_full <- sceptre_obj@covariate_data_frame
+grna_base      <- sub("-\\d+$", "", grna_names)
+
+MCH_guide_idx     <- which(grna_base %in% Repologle_associated_genes)
+MCH_guide_targets <- grna_base[MCH_guide_idx]
+
+NTC_guide_idx <- grep("^NTC-", grna_names, ignore.case = TRUE)
+NTC_names     <- grna_names[NTC_guide_idx]
+
+# ── ★ 测试：只取前3个target，前2个NTC ─────────────────────────
+unique_targets <- unique(MCH_guide_targets)[1:3]
+NTC_guide_idx  <- NTC_guide_idx[1:2]
+NTC_names      <- NTC_names[1:2]
+
+print(paste("TEST targets:", paste(unique_targets, collapse = ", ")))
+print(paste("TEST NTC:", paste(NTC_names, collapse = ", ")))
+
+
+# ── 2. 找cells ────────────────────────────────────────────────
+target_cells_list <- vector("list", length(unique_targets))
+names(target_cells_list) <- unique_targets
+
+for (tgt in unique_targets) {
+  guide_idxs <- MCH_guide_idx[MCH_guide_targets == tgt]
+  cells <- c()
+  for (gi in guide_idxs) {
+    cells <- union(cells, which(sceptre_obj@grna_matrix[[1]][gi, ] != 0))
+  }
+  target_cells_list[[tgt]] <- cells
+  message("target=", tgt, " cells=", length(cells))
+}
+
+NTC_cells_list <- vector("list", length(NTC_guide_idx))
+names(NTC_cells_list) <- NTC_names
+
+for (k in seq_along(NTC_guide_idx)) {
+  gi <- NTC_guide_idx[k]
+  NTC_cells_list[[k]] <- which(sceptre_obj@grna_matrix[[1]][gi, ] != 0)
+  message("NTC=", NTC_names[k], " cells=", length(NTC_cells_list[[k]]))
+}
+
+all_needed_cells <- sort(unique(c(unlist(target_cells_list), unlist(NTC_cells_list))))
+print(paste("Total cells:", length(all_needed_cells)))
+
+# ★ 建立全局cell index → exp_mat列名的映射
+cell_index_to_colname <- as.character(all_needed_cells)
+names(cell_index_to_colname) <- as.character(all_needed_cells)
+
+# ── 3. 只读前50个gene做测试 ───────────────────────────────────
+n_genes    <- 50
+gene_names <- rownames(sceptre_obj@response_matrix[[1]])[1:n_genes]
+
+exp_list <- vector("list", n_genes)
+for (k in seq_len(n_genes)) {
+  row_full      <- sceptre_obj@response_matrix[[1]][k, ]
+  exp_list[[k]] <- row_full[all_needed_cells]
+  if (k %% 10 == 0) message("gene ", k, "/", n_genes)
+}
+
+exp_mat <- do.call(rbind, exp_list)
+rownames(exp_mat) <- gene_names
+colnames(exp_mat) <- as.character(all_needed_cells)  # 列名 = 全局cell index的字符串
+
+print(paste("exp_mat dim:", nrow(exp_mat), "x", ncol(exp_mat)))
+print(paste("colnames sample:", paste(head(colnames(exp_mat), 5), collapse=", ")))
+
+
+# ── 4. Train/test split ───────────────────────────────────────
+n_targets <- length(unique_targets)
+n_NTC     <- length(NTC_cells_list)
+
+response_train_list <- vector("list", n_targets + n_NTC)
+response_test_list  <- vector("list", n_targets)
+cov_train_list      <- vector("list", n_targets + n_NTC)
+guide_names_out     <- character(n_targets + n_NTC)
+
+for (k in seq_along(unique_targets)) {
+  tgt     <- unique_targets[k]
+  cells   <- target_cells_list[[tgt]]  # 全局cell index
+  n       <- length(cells)
+  cells_s <- sample(cells, n)
+  n_train <- floor(n / 2)
+
+  train_cells <- cells_s[seq_len(n_train)]
+  test_cells  <- cells_s[(n_train + 1):n]
+
+  # ★ 关键修复：用as.character转换，与colnames(exp_mat)一致
+  train_cols <- as.character(train_cells)
+  test_cols  <- as.character(test_cells)
+
+  # ★ 验证所有cells都在exp_mat中
+  stopifnot(all(train_cols %in% colnames(exp_mat)))
+  stopifnot(all(test_cols  %in% colnames(exp_mat)))
+
+  response_train_list[[k]] <- exp_mat[, train_cols, drop = FALSE]
+  response_test_list[[k]]  <- exp_mat[, test_cols,  drop = FALSE]
+  cov_train_list[[k]]      <- covariate_full[train_cells, , drop = FALSE]
+  guide_names_out[k]       <- tgt
+  message("target=", tgt, " train=", n_train, " test=", n - n_train)
+}
+
+for (k in seq_along(NTC_cells_list)) {
+  pos        <- n_targets + k
+  cells      <- NTC_cells_list[[k]]
+  cell_cols  <- as.character(cells)
+  stopifnot(all(cell_cols %in% colnames(exp_mat)))
+  response_train_list[[pos]] <- exp_mat[, cell_cols, drop = FALSE]
+  cov_train_list[[pos]]      <- covariate_full[cells, , drop = FALSE]
+  guide_names_out[pos]       <- NTC_names[k]
+}
+
+
+# ── 5. 合并 & 检查 ────────────────────────────────────────────
+response_OPERA  <- do.call(cbind, response_train_list)
+covariate_OPERA <- do.call(rbind, cov_train_list)
+
+ncols_each    <- sapply(response_train_list, ncol)
+guide_per_col <- rep(guide_names_out, times = ncols_each)
+
+i <- match(guide_per_col, guide_names_out)
+j <- seq_along(guide_per_col)
+
+guide_by_col <- sparseMatrix(
+  i = i, j = j, x = 1L,
+  dims = c(length(guide_names_out), length(guide_per_col)),
+  dimnames = list(guide_names_out, colnames(response_OPERA))
+)
+
+response_topic <- do.call(cbind, response_test_list)
+rownames(response_topic) <- gene_names
+rownames(response_OPERA)  <- gene_names
+
+# ── ★ 结果检查 ────────────────────────────────────────────────
+print("=== TEST RESULTS ===")
+print(paste("response_OPERA dim:", nrow(response_OPERA), "x", ncol(response_OPERA)))
+print(paste("covariate_OPERA dim:", nrow(covariate_OPERA), "x", ncol(covariate_OPERA)))
+print(paste("guide_by_col dim:", nrow(guide_by_col), "x", ncol(guide_by_col)))
+print(paste("response_topic dim:", nrow(response_topic), "x", ncol(response_topic)))
+print("guide rownames:"); print(rownames(guide_by_col))
+print("cells per guide:"); print(rowSums(guide_by_col))
+print("TEST PASSED!")
+```
+
+

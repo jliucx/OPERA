@@ -1,0 +1,4074 @@
+---
+title: "Topic Modeling of Perturb-Responsive Cells: Gene-Set Mediation Analysis for MCH and Asthma"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+date: "2026-01-03"
+knitr:
+  opts_chunk:
+    echo: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+## Overview
+
+This notebook implements a three-layer gene-set mediation framework that links GWAS peripheral genes to complex traits through de novo co-regulated transcriptional programs discovered by topic modeling of Perturb-seq data. The analysis is applied to two traits:
+
+1. **Mean Corpuscular Hemoglobin (MCH)** — a quantitative hematological trait (GWAS: GCST90002390), using the **Replogle** K562 Perturb-seq dataset. 689 GWAS loci were mapped to effector genes via a 200 kb window and FLAMES (4,475 genes from 200 kb; 283 from FLAMES), yielding 1,297 perturbations. 441 out of 689 (64%) GWAS loci are explained by our model. 
+
+2. **Asthma** — a complex immune-mediated disease (GWAS: GCST010043), using the **Nadig** Perturb-seq dataset. GWAS loci were mapped to effector genes via a 200 kb window and FLAMES (1251 genes from 200 kb; 127 from FLAMES). This yielded 75 asthma-relevant perturbations.
+
+### Analysis framework
+
+The mediation framework proceeds in three stages:
+
+**Stage 1 — Topic modeling (split-sample, first half of cells):**
+For each trait, we restrict to perturbation-receiving cells whose guide targets are linked to GWAS loci. Half of these cells are used to fit a topic model with `fastTopics`, and grade-of-membership differential expression (DE) analysis (LFSR ≤ 0.05, standardized effect size ≥ 2.5, log fold change >0.5) identifies genes that define each latent topic (i.e., co-regulated transcriptional programs). Topics with ≥5 genes are retained as candidate gene sets.
+
+**Stage 2 — OPERA: gene → gene-set associations (held-out second half of cells):**
+The remaining half of perturbation-receiving cells are passed to OPERA, which estimates perturbation–gene-set association p-values. This split-sample design ensures that the same cells are not used both to define gene sets and to test perturbation–mediator associations, guarding against overfitting.
+
+**Stage 3 — Gene-set → trait associations + AdaFilter mediation test:**
+Gene-level GWAS burden-test p-values for the trait are aggregated within each gene set using Fisher's method, capturing the cumulative trait-relevance of each program. The two p-value layers (gene → gene-set from OPERA; gene-set → trait from Fisher aggregation) are then jointly tested for mediation using **AdaFilter**, which adaptively combines evidence while accounting for dependence across the two layers.
+
+### Key design choices
+
+- **Cis-gene exclusion:** For each perturbation, genes that are cis-regulated by the perturbed locus (from `discovery_pairs_cis`) are removed from the corresponding topic modules before computing geneset–trait p-values. This prevents circular evidence where the perturbed gene's own cis-effects inflate the geneset–trait signal.
+- **Negative control:** 514 non-targeting perturbations from the Replogle dataset serve as negative controls. Under a 5% FDR threshold, only 0.07% of negative-control pairs are called significant, demonstrating excellent calibration.
+- **Comparison with Ota et al.:** Of 13 Ota (peripheral gene - downstream regulated pathway) pairs present in our test set, 11 are identified as significant by OPERA. confirming biological concordance.
+
+## Utility functions and libraries
+
+The setup chunk below loads all required libraries and defines shared helper functions used throughout the analysis:
+
+- `gg_qqplot` / `gg_qqplot_list` / `gg_qqplot_df`: QQ plot utilities for visualizing p-value calibration under the null.
+- `combine_p_by_target`: Combines gRNA-level p-values to the gene-target level using Bonferroni correction (k × min p-value).
+- `plot_gene_module_network2`: Bipartite igraph visualization connecting peripheral genes (circles) to latent topic modules (squares), with edge width scaled by gene→module association strength.
+
+```{r message=FALSE, warning=FALSE}
+library(igraph)
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(tibble)
+library(tidyr)
+library(sceptre)
+library(readr)
+library(dplyr)
+library(Matrix)
+library(parallel)
+library(BH)
+library(Rcpp)
+library(peakRAM)
+library(heavytailcombtest)
+library(gridExtra)
+library(eulerr)
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(tibble)
+library(ACAT)
+library(MASS)
+
+
+gg_qqplot_list <- function(pval_list, ci = 0.95, cap = 6, title = "QQ Plot") {
+  # pval_list: named list of numeric p-value vectors
+
+  # 1. 构造数据框：method, p
+  pts_df <- map_dfr(names(pval_list), function(name) {
+    tibble(
+      Method = name,
+      p = pval_list[[name]]
+    )
+  })
+
+  # 2. 清洗和排序
+  pts_df <- pts_df %>%
+    filter(!is.na(p), p > 0) %>%
+    mutate(
+      observed = pmin(-log10(p), cap)
+    ) %>%
+    group_by(Method) %>%
+    arrange(p, .by_group = TRUE) %>%
+    mutate(
+      rank_idx = row_number(),
+      n = n(),
+      expected = -log10(ppoints(n))[rank_idx]
+    ) %>%
+    ungroup()
+
+  # 3. 构造 envelope（以最大 n 为准）
+  max_n <- max(pts_df$n)
+  exp_env <- -log10(ppoints(max_n))
+  lower_env <- pmin(-log10(qbeta((1 - ci)/2, seq_len(max_n), rev(seq_len(max_n)))), cap)
+  upper_env <- pmin(-log10(qbeta((1 + ci)/2, seq_len(max_n), rev(seq_len(max_n)))), cap)
+
+  env_df <- tibble(
+    expected = c(exp_env, rev(exp_env)),
+    ymin = c(lower_env, rev(upper_env)),
+    ymax = c(upper_env, rev(lower_env))
+  )
+
+  # 4. 作图
+  ggplot() +
+    geom_ribbon(data = env_df, aes(x = expected, ymin = ymin, ymax = ymax),
+                fill = "grey80", alpha = 0.3) +
+    geom_line(data = pts_df,
+              aes(x = expected, y = observed, color = Method, group = Method),
+              size = 1) +
+    geom_point(data = pts_df,
+               aes(x = expected, y = observed, color = Method),
+               size = 1.5, alpha = 0.6) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", alpha = 0.5) +
+    labs(
+      title = title,
+      x = expression(Expected~-log[10](italic(P))),
+      y = expression(Observed~-log[10](italic(P))),
+      color = "Method"
+    ) +
+    ylim(0, cap) +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5))
+}
+
+
+gg_qqplot <- function(ps, ci = 0.95, title = "QQ Plot") {
+  n <- length(ps)
+  df <- data.frame(
+    observed = pmin(-log10(sort(ps)), 6), # Cap observed values at 4
+    expected = -log10(ppoints(n)),
+    clower = pmin(-log10(qbeta(p = (1 - ci) / 2, shape1 = 1:n, shape2 = n:1)), 6), # Cap clower values at 4
+    cupper = pmin(-log10(qbeta(p = (1 + ci) / 2, shape1 = 1:n, shape2 = n:1)), 6)  # Cap cupper values at 4
+  )
+
+  log10Pe <- expression(paste("Expected -log"[10], plain(P)))
+  log10Po <- expression(paste("Observed -log"[10], plain(P)))
+
+  ggplot(df) +
+    geom_ribbon(mapping = aes(x = expected, ymin = clower, ymax = cupper), alpha = 0.1) +
+    geom_point(aes(expected, observed), size = 1.5, color = "red") +
+    geom_abline(intercept = 0, slope = 1, alpha = 0.5) +
+    xlab(log10Pe) + 
+    ylab(log10Po) +
+    ylim(0, 6) + # Limit y-axis to 0-5
+    ggtitle(title) # Add title
+}
+
+
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+gg_qqplot_df <- function(pmat,
+                         ci    = 0.95,
+                         title = "QQ Plot",
+                         cap   = 6) {
+  # pmat: numeric data.frame or matrix; rows = methods, cols = p-values
+  # ci:   confidence level for the envelope
+  # title: plot title
+  # cap:  maximum -log10(p) to display
+  
+  # 1. reshape & filter out NAs, compute expected & observed per method
+  pmat[pmat<=0]<-1e-250
+    pmat[pmat>=1]<-1-1e-250
+  pts_df <- pmat %>% 
+    as.data.frame() %>% 
+    rownames_to_column("Method") %>% 
+    pivot_longer(-Method, names_to="dummy", values_to="p") %>% 
+    filter(!is.na(p)) %>%          # drop NAs
+    group_by(Method) %>% 
+    arrange(p) %>% 
+    mutate(
+      rank_idx = row_number(),
+      n_i      = n(),                                 # how many p’s
+      expected = -log10(ppoints(n_i))[rank_idx],      # expected quantile
+      observed = pmin(-log10(p), cap)                 # cap at ‘cap’
+    ) %>% 
+    ungroup()
+  
+  # 2. build a single envelope for the *largest* group size
+  max_n <- pts_df %>% pull(n_i) %>% max()
+  exp_env <- -log10(ppoints(max_n))
+  lower_env <- pmin(-log10(qbeta((1-ci)/2,  seq_len(max_n), rev(seq_len(max_n)))), cap)
+  upper_env <- pmin(-log10(qbeta((1+ci)/2,  seq_len(max_n), rev(seq_len(max_n)))), cap)
+  env_df <- tibble(expected = exp_env, ymin = lower_env, ymax = upper_env)
+  
+  # 3. plot
+  ggplot() +
+    geom_ribbon(data = env_df,
+                aes(x = expected, ymin = ymin, ymax = ymax),
+                fill  = "grey80", alpha = 0.3) +
+    geom_line(data = pts_df,
+              aes(x = expected, y = observed, color = Method, group = Method),
+              size = 1) +
+    geom_point(data = pts_df,
+               aes(x = expected, y = observed, color = Method),
+               size = 1.5) +
+    geom_abline(intercept = 0, slope = 1,
+                linetype = "dashed", alpha = 0.5) +
+    labs(title = title,
+         x     = expression(Expected~ -log[10](P)),
+         y     = expression(Observed~ -log[10](P)),
+         color = "Method") +
+    ylim(0, cap) +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5))
+}
+
+
+combine_p_by_target<- function(P, map, non_targeting_label = "non-targeting") {
+  stopifnot(!is.null(rownames(P)))
+  # 去重并按 P 行对齐
+  if (any(duplicated(map$grna_id))) {
+    map <- map[!duplicated(map$grna_id), , drop = FALSE]
+  }
+  miss <- setdiff(rownames(P), map$grna_id)
+  if (length(miss)) stop("map 缺少这些 grna_id: ", paste(miss, collapse = ", "))
+  map <- map[match(rownames(P), map$grna_id), , drop = FALSE]
+
+  is_nt <- map$grna_target == non_targeting_label
+
+  ## 1) 非靶向：原样保留（行名继续用 grna_id）
+  P_nt   <- P[is_nt, , drop = FALSE]               # 不做任何修改
+
+  ## 2) 其它 target：按 target 合并为一行（Bonferroni：k * min）
+  P_g    <- P[!is_nt, , drop = FALSE]
+  map_g  <- map[!is_nt, , drop = FALSE]
+  groups <- split(seq_len(nrow(P_g)), map_g$grna_target)
+
+  res_list <- lapply(names(groups), function(tg) {
+    idx <- groups[[tg]]
+    sub <- P_g[idx, , drop = FALSE]
+    k   <- length(idx)
+
+    any_non_na <- colSums(!is.na(sub)) > 0
+    min_p <- rep(NA_real_, ncol(P_g))
+    if (any(any_non_na)) {
+      min_p[any_non_na] <- apply(sub[, any_non_na, drop = FALSE], 2, min, na.rm = TRUE)
+    }
+    pmin(1, k * min_p)
+  })
+  P_comb <- do.call(rbind, res_list)
+  rownames(P_comb) <- names(groups)
+  colnames(P_comb) <- colnames(P)
+
+  ## 3) 绑定结果：先合并后的 targets，再原样的 non-targeting
+  out <- rbind(P_comb, P_nt)
+  out
+}
+
+## 用法
+# P <- as.matrix(max_stat)  # 你的 p 值矩阵
+# res <- combine_p_by_target_keep_nt(P, map, non_targeting_label = "non-targeting")
+# 结果 res：行包含 每个 target 的一行 + 每条 non-targeting guide 的原样行
+
+layout_with_fr <- function (graph, coords = NULL, dim = 2, niter = 500, start.temp = sqrt(vcount(graph)), 
+    grid = c("auto", "grid", "nogrid"), weights = NULL, minx = NULL, 
+    maxx = NULL, miny = NULL, maxy = NULL, minz = NULL, maxz = NULL, 
+    coolexp = deprecated(), maxdelta = deprecated(), area = deprecated(), 
+    repulserad = deprecated(), maxiter = deprecated()) 
+{
+    ensure_igraph(graph)
+    coords[] <- as.numeric(coords)
+    dim <- as.numeric(dim)
+    if (dim != 2L && dim != 3L) {
+        stop("Dimension must be two or three")
+    }
+    if (!missing(niter) && !missing(maxiter)) {
+        stop("Both `niter' and `maxiter' are given, give only one of them")
+    }
+    if (!missing(maxiter)) 
+        niter <- maxiter
+    niter <- as.numeric(niter)
+    start.temp <- as.numeric(start.temp)
+    grid <- igraph.match.arg(grid)
+    grid <- switch(grid, grid = 0L, nogrid = 1L, auto = 2L)
+    if (is.null(weights) && "weight" %in% edge_attr_names(graph)) {
+        weights <- E(graph)$weight
+    }
+    if (!is.null(weights) && any(!is.na(weights))) {
+        weights <- as.numeric(weights)
+    }
+    else {
+        weights <- NULL
+    }
+    if (!is.null(minx)) 
+        minx <- as.numeric(minx)
+    if (!is.null(maxx)) 
+        maxx <- as.numeric(maxx)
+    if (!is.null(miny)) 
+        miny <- as.numeric(miny)
+    if (!is.null(maxy)) 
+        maxy <- as.numeric(maxy)
+    if (!is.null(minz)) 
+        minz <- as.numeric(minz)
+    if (!is.null(maxz)) 
+        maxz <- as.numeric(maxz)
+    if (lifecycle::is_present(coolexp)) {
+        lifecycle::deprecate_warn("0.8.0", "layout_with_fr(coolexp = )")
+    }
+    if (lifecycle::is_present(maxdelta)) {
+        lifecycle::deprecate_warn("0.8.0", "layout_with_fr(maxdelta = )")
+    }
+    if (lifecycle::is_present(area)) {
+        lifecycle::deprecate_warn("0.8.0", "layout_with_fr(area = )")
+    }
+    if (lifecycle::is_present(repulserad)) {
+        lifecycle::deprecate_warn("0.8.0", "layout_with_fr(repulserad = )")
+    }
+    on.exit(.Call(R_igraph_finalizer))
+    if (dim == 2) {
+        res <- .Call(R_igraph_layout_fruchterman_reingold, graph, 
+            coords, niter, start.temp, weights, minx, maxx, miny, 
+            maxy, grid)
+    }
+    else {
+        res <- .Call(R_igraph_layout_fruchterman_reingold_3d, 
+            graph, coords, niter, start.temp, weights, minx, 
+            maxx, miny, maxy, minz, maxz)
+    }
+    res
+}
+plot_gene_module_network2 <- function(df12,
+                                      gene_modules_id = NULL,
+                                      top_n_per_module = NULL,
+                                      top_n_gene = 80,
+                                      pcap = 1e-300,
+                                      edge_by = c("none","snp_geneset"),
+                                      layout_fun = NULL,  
+                                      highlight_mod = NULL,
+                                      out_pdf = NULL,
+                                      width = 12, height = 9,
+                                      label_genes = TRUE,
+                                      label_modules = TRUE,
+                                      size_scale = 0.7,
+                                      mod_size_range = c(14, 40),
+                                      gene_size_range = c(6, 18),
+                                      highlight_genes = NULL
+                                      ) {
+
+  edge_by <- match.arg(edge_by)
+  if (is.null(layout_fun)) layout_fun <- igraph::layout_with_fr
+
+  d <- df12 %>%
+    dplyr::transmute(
+      module = as.character(module),
+      gene   = as.character(gene_name),
+      p_snp  = pmax(as.numeric(snp_geneset), pcap),
+      p_mod  = pmax(as.numeric(geneset_trait), pcap)
+    ) %>%
+    dplyr::filter(!is.na(module), !is.na(gene)) %>%
+    dplyr::group_by(module, gene) %>%
+    dplyr::summarise(
+      p_snp = min(p_snp, na.rm = TRUE),
+      p_mod = min(p_mod, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  if (!is.null(top_n_per_module)) {
+    d <- d %>%
+      dplyr::group_by(module) %>%
+      dplyr::arrange(p_snp, .by_group = TRUE) %>%
+      dplyr::slice_head(n = top_n_per_module) %>%
+      dplyr::ungroup()
+  }
+
+  if (!is.null(top_n_gene)) {
+    top_genes <- d %>%
+      dplyr::group_by(gene) %>%
+      dplyr::summarise(best_p = min(p_snp, na.rm = TRUE), .groups = "drop") %>%
+      dplyr::arrange(best_p) %>%
+      dplyr::slice_head(n = top_n_gene) %>%
+      dplyr::pull(gene)
+    d <- d %>% dplyr::filter(gene %in% top_genes)
+  }
+
+  mod_tbl <- d %>%
+    dplyr::group_by(module) %>%
+    dplyr::summarise(p_mod = min(p_mod, na.rm = TRUE), .groups = "drop") %>%
+    dplyr::mutate(
+      w_mod = if (!is.null(gene_modules_id)) {
+        module_sizes <- sapply(gene_modules_id, length)
+        module_sizes[module]
+      } else {
+        -log10(p_mod)
+      }
+    )
+
+  # 用连接的 module 数量作为基因节点大小权重
+  gene_mod_count_tbl <- d %>%
+    dplyr::group_by(gene) %>%
+    dplyr::summarise(
+      p_snp   = min(p_snp, na.rm = TRUE),
+      n_mods  = dplyr::n_distinct(module),
+      .groups = "drop"
+    )
+
+  vertices <- dplyr::bind_rows(
+    mod_tbl %>% dplyr::transmute(name = module, type = "module", weight = w_mod),
+    gene_mod_count_tbl %>% dplyr::transmute(name = gene, type = "gene", weight = n_mods)
+  )
+
+  edges <- d %>% dplyr::transmute(from = module, to = gene, p_snp = p_snp)
+
+  g <- igraph::graph_from_data_frame(edges, directed = FALSE, vertices = vertices)
+
+  igraph::V(g)$shape <- ifelse(igraph::V(g)$type == "module", "square", "circle")
+  igraph::V(g)$color <- ifelse(igraph::V(g)$type == "module", "grey30", "lightskyblue")
+  igraph::V(g)$label.color <- "black"
+  igraph::V(g)$frame.color <- NA
+
+  mod_ids  <- which(igraph::V(g)$type == "module")
+  gene_ids <- which(igraph::V(g)$type == "gene")
+
+  # 只 highlight 传入的 highlight_genes，不再自动标红多模块基因
+  if (!is.null(highlight_mod)) {
+    highlight_mod_ids <- mod_ids[igraph::V(g)$name[mod_ids] %in% highlight_mod]
+    igraph::V(g)$color[highlight_mod_ids] <- "green3"
+  }
+
+  if (!is.null(highlight_genes)) {
+    highlight_ids <- gene_ids[igraph::V(g)$name[gene_ids] %in% highlight_genes]
+    igraph::V(g)$color[highlight_ids] <- "red"
+  }
+
+  igraph::V(g)$size <- NA_real_
+  if (length(mod_ids) > 0) {
+    igraph::V(g)$size[mod_ids] <- scales::rescale(igraph::V(g)$weight[mod_ids],
+                                                   to = mod_size_range * size_scale)
+  }
+  if (length(gene_ids) > 0) {
+    w <- igraph::V(g)$weight[gene_ids]
+    if (length(unique(w)) == 1) {
+      # 所有基因连接相同数量的 module，给统一大小
+      igraph::V(g)$size[gene_ids] <- mean(gene_size_range) * size_scale
+    } else {
+      igraph::V(g)$size[gene_ids] <- scales::rescale(w, to = gene_size_range * size_scale)
+    }
+  }
+
+  if (edge_by == "snp_geneset") {
+    igraph::E(g)$width <- scales::rescale(-log10(igraph::E(g)$p_snp), to = c(0.5, 4))
+  } else {
+    igraph::E(g)$width <- 1
+  }
+  igraph::E(g)$color <- "grey70"
+
+  igraph::V(g)$label <- NA_character_
+  if (label_modules) igraph::V(g)$label[mod_ids] <- igraph::V(g)$name[mod_ids]
+  if (label_genes)   igraph::V(g)$label[gene_ids] <- igraph::V(g)$name[gene_ids]
+  igraph::V(g)$label.cex <- ifelse(igraph::V(g)$type == "module", 0.9, 0.7)
+
+  if (!is.null(out_pdf)) grDevices::pdf(out_pdf, width = width, height = height)
+  plot(g, layout = layout_fun(g), vertex.label.dist = 0, edge.curved = 0)
+  if (!is.null(out_pdf)) grDevices::dev.off()
+
+  invisible(g)
+}
+
+```
+
+# Construct topic gene sets
+
+Topic modeling was applied with `fastTopics` to the perturb-responsive cells (first half of cells receiving MCH-associated perturbations from the Replogle dataset). The `de` object below contains the result of grade-of-membership differential expression analysis on K=50 topics fitted to cells whose guide targets overlap MCH GWAS effector genes (mapped via FLAMES + 200 kb window).
+
+`get_de_genes()` extracts the "top" genes for each topic using three filters simultaneously:
+- **LFSR ≤ 0.05**: high posterior confidence (local false sign rate, analogous to a Bayesian FDR)
+- **|z| ≥ 2.5**: large standardized effect size
+- **|β| ≥ 0.5**: minimum fold-change threshold (log-scale posterior mean)
+
+Topics with fewer than 5 genes after filtering are discarded (`filtered_list_2`), as they are too small to support reliable downstream aggregation tests.
+
+```{r}
+get_de_genes <- function(de, k,
+                         lfsr_thr = 0.05,
+                         z_thr    = 2.5,
+                         fc_thr   = 0.5,
+                         gene_names) {
+
+  z_k     <- de$z[, k]
+  lfsr_k  <- de$lfsr[, k]
+  beta_k  <- de$postmean[, k]   
+
+  # 先去掉 NA
+  ok <- !is.na(z_k) & !is.na(lfsr_k) & !is.na(beta_k)
+
+  idx <- which(
+    ok &
+      lfsr_k <= lfsr_thr &      # 置信度高
+      abs(z_k)   >= z_thr &     # z 比较大
+      abs(beta_k) >= fc_thr     # fold change 比较大
+  )
+
+  gene_names[idx]
+}
+
+
+
+
+
+de <-  readRDS("/project/xuanyao/jiaming/Getting_started/data/CDT4/topic_model/flames+200kb/de_50.rds")
+
+
+
+de_genes_list <- lapply(seq_len(ncol(de$z)),
+                        function(k) get_de_genes(de, k,gene_names=rownames(de$F)))
+names(de_genes_list) <- paste0("k", seq_len(ncol(de$z)))
+
+filtered_list_2 <- Filter(function(x) length(x) > 4, de_genes_list)
+
+length(filtered_list_2)
+
+```
+
+
+# MCH analysis (Replogle dataset, K = 50 topics)
+
+The primary MCH analysis uses K = 50 topics fitted to Replogle K562 Perturb-seq cells receiving perturbations targeting MCH-associated GWAS genes (1,297 perturbations; loci mapped via FLAMES + 200 kb window). Gene sets were derived with thresholds LFSR ≤ 0.01, |z| ≥ 2, |β| ≥ 0.5. Of the 50 topics, 47 contain more than 5 genes and are retained.
+
+The recovered programs can be grouped into five broad biological categories consistent with erythroid biology:
+1. **Hemoglobin synthesis** — iron handling, heme metabolism, red blood cell maturation (e.g., ABCB10, HBA1, HBD, KLF1, SLC25A37, TFRC)
+2. **Cell cycle and DNA replication** — G0/G1, S-phase, G2/M checkpoint control (e.g., CCNA2, CCNF, CLSPN, BRIP1, NUP214, POLE, E2F2)
+3. **Autophagy and stress adaptation** — quality control and remodeling under high biosynthetic demand (e.g., AP2A1, ATR, EIF2B4, EIF3E/F/M, HSPA9, WDFY3, TRAPPC10)
+4. **Translation and proteostasis** — cytoplasmic translation, ribosome biogenesis, ubiquitin-mediated protein catabolism
+5. **Core metabolism and redox biology** — amino acid biosynthesis, one-carbon metabolism, purine metabolism, heme pathways, antioxidant/detoxification
+
+## GO enrichment of topic gene sets
+
+Gene sets from each topic are submitted to g:Profiler (`gost`) as a multi-query, testing against GO:BP, GO:MF, and KEGG with FDR correction. The result is reshaped into a long table (`go_long`) and the top terms per topic are extracted for annotation of significant mediating modules downstream.
+
+```{r}
+library(gprofiler2)
+ gene_modules_id <- readRDS("/project/xuanyao/jiaming/Getting_started/data/repologle/topic_geneset/flames+200kb/de_50_0.01_2_0.5.rds")
+
+ de_10_0.01_2_0.5 <-gene_modules_id
+
+gene_sets <- lapply(de_10_0.01_2_0.5, function(x) unique(as.character(x)))
+
+# gene_sets <- lapply(de_10_0.01_2_0.5 , function(x) unique(as.character(x)))
+
+# 建议给每个 set 一个名字（没有就补上）
+if (is.null(names(gene_sets))) names(gene_sets) <- paste0("set_", seq_along(gene_sets))
+
+res <- gost(
+  query = gene_sets,                 # list of 100 gene vectors
+  organism = "hsapiens",
+  multi_query = TRUE,
+  correction_method = "fdr",
+  user_threshold = 0.05,
+  sources = c("GO:BP","GO:MF","KEGG")
+)
+
+
+
+# geneset 名字：如果你有 gene_sets 的 names 就用它；否则自动生成
+gs_names <- names(gene_sets)
+if (is.null(gs_names)) gs_names <- paste0("set_", seq_along(res$result$significant[[1]]))
+
+# GO term 名字：用 term_id 或 term_name（建议 term_id 更稳定）
+go_names <- paste0(res$result$source, ":", res$result$term_id)
+# 如果你更想用可读名字：
+# go_names <- paste0(res$result$source, ":", res$result$term_name)
+
+# 1) list -> 矩阵：每列一个 term，每行一个 geneset
+sig_term_by_set <- do.call(cbind, res$result$significant)
+storage.mode(sig_term_by_set) <- "logical"
+
+# 2) 转成“geneset(行) × term(列)”的 index matrix
+idx_mat <- sig_term_by_set  # 现在行=geneset, 列=term（通常就是这个方向）
+rownames(idx_mat) <- gs_names
+colnames(idx_mat) <- go_names
+
+
+# 如果你发现方向反了（极少数情况），就用这一句修正：
+# idx_mat <- t(idx_mat)
+
+library(dplyr)
+library(tidyr)
+
+go_tbl <- as_tibble(res$result)
+
+# geneset 名称（如果你有 names(gene_sets) 就用它；否则自动生成）
+G <- length(go_tbl$p_values[[1]])
+gs_names <- names(gene_sets)
+if (is.null(gs_names) || length(gs_names) != G) gs_names <- paste0("set_", seq_len(G))
+
+# 展开：term × geneset 的长表
+go_long <- go_tbl %>%
+  mutate(
+    query   = list(gs_names),
+    p_value = p_values,
+    sig     = significant       # significant 列也是 list，记录每个 geneset 是否显著
+  ) %>%
+  dplyr::select(source, term_id, term_name, query, p_value, sig) %>%
+  unnest(c(query, p_value, sig)) %>%
+  filter(sig == TRUE)  
+
+# 每个 geneset 取 top10（p_value 最小）
+top10_tbl <- go_long %>%
+  group_by(query) %>%
+  arrange(p_value, .by_group = TRUE) %>%
+  ungroup()
+
+# 你想要的：每个 geneset 的 top10 term_name（以及可选的 p_value）
+top10_names <- top10_tbl %>%
+  group_by(query) %>%
+  summarise(top10_term_name = list(term_name), .groups = "drop")
+
+
+
+# 注意！！！！！！！！！！！！！！！是按 1， 10 ，11 等排序
+```
+
+```r
+library(openxlsx)
+wb <- createWorkbook()
+for (q in sort(unique(top10_tbl$query))) {
+  df_sheet <- top10_tbl %>%
+    filter(query == q) %>%
+    dplyr::select(term_name, p_value) %>%
+    as.data.frame()
+  addWorksheet(wb, q)
+  writeData(wb, q, df_sheet)
+}
+saveWorkbook(wb, "/project/xuanyao/jiaming/paper/GO_terms_pvalue_MCH_k50.xlsx", overwrite = TRUE)
+```
+
+
+
+
+
+## Geneset–trait associations and AdaFilter mediation test (MCH, K50)
+
+This section implements the third stage of the mediation framework: computing gene-set → trait association p-values and running AdaFilter for joint mediation testing.
+
+**Gene-set → trait p-values (Fisher aggregation):**
+Gene-level burden-test p-values for MCH (from `MCH_summary.tsv`, model M1.01) are aggregated within each topic gene set using Fisher's method. This captures the cumulative evidence that genes in a given transcriptional program are enriched for MCH associations. Before aggregation, each topic's gene set is filtered to remove genes that are cis-regulated by the target perturbation (from `discovery_pairs_cis`), implementing the cis-gene exclusion described in the Methods. This is the split-sample held-out half of cells — OPERA p-values from the first half were pre-computed and stored in `geneset_p_value.rds`.
+
+**AdaFilter:**
+The two p-value columns — `p_snp_geneset` (gene → gene set, from OPERA) and `p_fisher` (gene set → trait, from Fisher aggregation) — are passed jointly to `adaFilter(r=2, alpha=0.05)`. AdaFilter tests the composite null that at least one of the two layers is null, adaptively combining evidence while controlling for dependence. Pairs with `decision = 1` constitute the significant mediation signals.
+
+```{r}
+library(data.table)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(heavytailcombtest)
+
+# -----------------------------
+# 0) Read inputs
+# -----------------------------
+df <- fread("/project/xuanyao/jiaming/Getting_started/data/geneset_to_trait/MCH/MCH_summary.tsv")
+df2 <- df[grepl("M1.01", df$Name), ]
+
+Nadig_associated_perturbation <- readRDS("/project/xuanyao/jiaming/Getting_started/data/GWAS/MCH/flames+200kb_mapping/Repologle_associated_perturbations.rds")
+
+
+
+discovery_pairs_cis <- readRDS("/project/xuanyao/jiaming/Getting_started/data/repologle/discovery_pairs_cis.rds")
+
+
+ gene_modules_id <- readRDS("/project/xuanyao/jiaming/Getting_started/data/repologle/topic_geneset/flames+200kb/de_50_0.01_2_0.5.rds")
+
+
+
+# -----------------------------
+# 1) Build pv_map: gene-level MCH burden-test p-values
+#    Source: MCH_summary.tsv (GCST90002390), model M1.01
+#    Gene ID is extracted from the "Name" column (format: "...(ENSG...)")
+#    If multiple rows correspond to the same gene, take the minimum p-value
+# -----------------------------
+gene_id <- str_extract(df2$Name, "(?<=\\()[^()]+(?=\\))")
+
+lookup <- df2 %>%
+  mutate(ID = gene_id) %>%
+  filter(!is.na(ID), !is.na(p_value)) %>%
+  group_by(ID) %>%
+  summarise(p_value = min(p_value), .groups = "drop")
+
+pv_map <- setNames(lookup$p_value, lookup$ID)
+
+
+# -----------------------------
+# 2) Helper functions for p-value combination
+#    clean_p:         sanitize p-values (set non-positive/NA to NA)
+#    safe_comb:       Cauchy combination test (ACAT) — robust to correlation
+#    safe_comb_fisher: Fisher's method — chi-squared with 2k df; used as the
+#                     primary geneset-trait p-value because it weights all genes
+#                     equally and is interpretable for downstream aggregation
+# -----------------------------
+clean_p <- function(p) {
+  p <- as.numeric(p)
+  p[is.na(p) | p <= 0] <- NA
+  p
+}
+
+safe_comb <- function(p) {
+  p <- as.numeric(p)
+  p <- p[!is.na(p) & p > 0 & p <= 1]
+  if (length(p) == 0) return(NA_real_)
+  if (length(p) == 1) return(p)
+
+  combination.test(
+    p,
+    weights = NA,
+    method = "Cauchy",
+    tail.idx = 1
+  )
+}
+
+safe_comb_fisher <- function(p) {
+  p <- as.numeric(p)
+  p <- p[!is.na(p) & p > 0 & p <= 1]
+  if (length(p) == 0) return(NA_real_)
+  if (length(p) == 1) return(p)
+
+  stat <- -2 * sum(log(p))
+  stats::pchisq(stat, df = 2 * length(p), lower.tail = FALSE)
+}
+
+
+# -----------------------------
+# 3) Cis-gene exclusion (split-sample design)
+#    For each perturbation, identify cis-regulated response genes from
+#    discovery_pairs_cis and remove them from all topic modules.
+#    This ensures that the geneset-trait signal is not inflated by the
+#    perturbed gene's own cis-effects (the same reason we use the held-out
+#    half of cells for OPERA).
+#    n_removed records how many cis genes were excluded per perturbation.
+# -----------------------------
+make_filtered_modules <- function(gene_symbol, gene_modules_id, pairs_df) {
+  target_name <- gsub("^gRNA:", "", gene_symbol)
+
+
+  ids_to_remove <- unique(pairs_df$response_id[pairs_df$grna_target == target_name])
+
+  filtered_modules <- lapply(gene_modules_id, function(mod_ids) {
+    setdiff(mod_ids, ids_to_remove)
+  })
+
+  list(
+    modules   = filtered_modules,
+    n_removed = length(ids_to_remove)
+  )
+}
+
+filtered_by_perturbation <- setNames(
+  lapply(
+    Nadig_associated_perturbation,
+    make_filtered_modules,
+    gene_modules_id = gene_modules_id,
+    pairs_df = discovery_pairs_cis
+  ),
+  Nadig_associated_perturbation
+)
+
+
+# -----------------------------
+# 4) Compute module-level combined p-values per perturbation
+#    For each perturbation × topic module pair:
+#      - Collect gene-level MCH p-values for genes in the (filtered) module
+#      - Combine with ACAT (p_acat) and Fisher (p_fisher)
+#    p_fisher is used as the geneset-trait layer in AdaFilter
+# -----------------------------
+compute_for_one_pert <- function(pert) {
+  obj <- filtered_by_perturbation[[pert]]
+  gene_modules_id_pert <- obj$modules
+  n_removed <- obj$n_removed
+
+  # Collect gene-level MCH p-values for each module (after cis exclusion)
+  module_pvals <- lapply(gene_modules_id_pert, function(genes) {
+    p <- pv_map[genes]
+    names(p) <- genes
+    p[!is.na(p)]
+  })
+
+  # Aggregate within each module
+  p_acat <- map_dbl(module_pvals, ~ {
+    p <- clean_p(.x)
+    if (!length(p)) return(NA_real_)
+    as.numeric(safe_comb(p))
+  })
+
+  p_fisher <- map_dbl(module_pvals, ~ {
+    p <- clean_p(.x)
+    if (!length(p)) return(NA_real_)
+    as.numeric(safe_comb_fisher(p))
+  })
+
+  tibble(
+    snp       = pert,
+    n_removed = n_removed,  # number of cis-regulated genes removed from modules
+    module    = names(module_pvals),
+    n_genes   = lengths(gene_modules_id_pert),
+    n_matched = sapply(module_pvals, function(v) sum(!is.na(v))),
+    p_acat    = p_acat,
+    p_fisher  = p_fisher
+  )
+}
+
+module_results <- map_dfr(Nadig_associated_perturbation, compute_for_one_pert)
+
+# Inspect top module-level geneset-trait associations (sorted by Fisher p-value)
+
+
+```
+
+**Below are the significant peripheral gene-module pairs**
+
+```{r}
+library(tidyr)
+library(dplyr)
+library(tibble)
+
+# Load pre-computed OPERA p-values (gene → gene-set layer, held-out second half of cells)
+# Rows = perturbations (gRNA IDs); columns = topic modules (k1..k50)
+# Separate targeting perturbations from non-targeting controls
+snp_geneset_p_value<-  readRDS("/project/xuanyao/jiaming/paper/output/snake/repologle_MCH/flames+200kb/K50/3000_t_ACAT_resample/p_values/geneset_p_value.rds")
+snp_geneset_p_value_test <- snp_geneset_p_value[which(!grepl("non-",rownames(snp_geneset_p_value))),]
+snp_geneset_p_value_control <- snp_geneset_p_value[which(grepl("non-",rownames(snp_geneset_p_value))),]
+
+# Layer 1 (gene → gene-set): pivot OPERA p-value matrix to long format
+# Each row becomes one (perturbation, module) pair
+df1_long <- snp_geneset_p_value_test %>%
+  as.data.frame() %>%
+  rownames_to_column("snp") %>%
+  pivot_longer(
+    -snp,
+    names_to  = "module",
+    values_to = "p_snp_geneset"
+  )
+
+# Layer 2 (gene-set → trait): Fisher aggregated p-values computed above
+df2 <- module_results %>%
+  dplyr::select(module, p_fisher,snp)
+
+# Join both layers on (snp, module); drop pairs where either layer is NA
+merged <- df1_long %>%
+  left_join(df2, by = c("snp", "module")) %>%
+  relocate(snp, module, p_snp_geneset, p_fisher)%>% tidyr::drop_na()
+
+# AdaFilter joint mediation test (r=2: both layers must contribute signal)
+# alpha = 0.05 nominal threshold; decision=1 indicates a significant mediating pair
+X <- merged[,c(3,4)]
+
+library(adaFilter)
+
+result <- adaFilter(X, r = 2,alpha=0.05)
+
+merged$decision <- result$decision
+colnames(merged)[c(3,4)] <- c("snp_geneset","geneset_trait")
+
+head(merged[merged$decision==1,])
+
+
+dfl2 <- merged[merged$decision==1,]
+dfl2$gene_name <- dfl2$snp
+```
+
+The chunk below maps significant peripheral gene IDs (ENSG format from OPERA row names) back to gene symbols, and clusters them by genomic locus (200 kb window) so that co-located genes at the same GWAS locus are grouped together in downstream visualizations.
+
+```{r}
+# 0. ENSG -> symbol mapping from GTF
+gtf <- rtracklayer::import("/project/xuanyao/jiaming/Getting_started/data/protein_coding_genes/Homo_sapiens.GRCh38.112.gtf.gz",
+                            feature.type = "gene")
+gtf_df <- as.data.frame(gtf)[, c("gene_id", "gene_name")]
+colnames(gtf_df) <- c("ensg", "symbol")
+ensg_to_symbol <- setNames(gtf_df$symbol, gtf_df$ensg)
+
+# 1. Build rsid -> cluster_id: merge GWAS loci within 200kb on the same chromosome
+gwas_result <- readRDS("/project/xuanyao/jiaming/Getting_started/data/GWAS/MCH/flames+200kb_mapping/result.rds")
+
+rsid_locations <- gwas_result %>%
+  dplyr::select(rsid, locations) %>%
+  distinct() %>%
+  filter(!is.na(locations)) %>%
+  mutate(
+    chr = sub(":.*", "", locations),
+    # suppressWarnings: non-autosomal (X/Y/MT) or malformed entries produce NA,
+    # which are removed by the chr filter below — this is expected
+    pos = suppressWarnings(as.numeric(sub(".*:", "", locations)))
+  ) %>%
+  filter(chr %in% as.character(1:22)) %>%
+  arrange(chr, pos) %>%
+  group_by(chr) %>%
+  mutate(cluster_num = cumsum(c(1, diff(pos) > 200000))) %>%
+  ungroup() %>%
+  mutate(cluster_id = paste0(chr, "_", cluster_num)) %>%
+  dplyr::select(rsid, chr, pos, cluster_id)
+
+# 2. symbol -> rsid mapping from gwas_result (bridge: ENSG -> symbol -> rsid)
+symbol_to_rsid <- gwas_result %>%
+  filter(!is.na(symbol)) %>%
+  dplyr::select(symbol, rsid) %>%
+  distinct()
+
+# 3. Parse dfl2$snp ("gRNA:ENSG...") -> ENSG -> symbol -> rsid -> cluster_id
+tbl <- dfl2 %>%
+  mutate(ensg  = sub("^gRNA:", "", snp),
+         symbol = ensg_to_symbol[ensg]) %>%
+  # many-to-many is expected: one gene can be near multiple GWAS loci (multiple rsids),
+  # and the same gene can appear in multiple modules. Rows are collapsed in step 4
+  # by group_by(module, cluster_id).
+  left_join(symbol_to_rsid, by = "symbol", relationship = "many-to-many") %>%
+  left_join(rsid_locations %>% dplyr::select(rsid, cluster_id), by = "rsid") %>%
+  mutate(cluster_id = ifelse(is.na(cluster_id), paste0("solo_", ensg), cluster_id))
+
+# 4. Aggregate by module + cluster_id -> 4-column merged_df
+merged_df <- tbl %>%
+  group_by(module, cluster_id) %>%
+  summarise(
+    snp_geneset      = min(snp_geneset,   na.rm = TRUE),
+    geneset_trait    = min(geneset_trait, na.rm = TRUE),
+    merged_gene_name = paste(sort(unique(symbol[!is.na(symbol)])), collapse = "-"),
+    merged_loci      = paste(sort(unique(rsid[!is.na(rsid)])),     collapse = "-"),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    summary = paste0(merged_gene_name, "(", merged_loci, ")")
+  ) %>%
+  dplyr::select(module, merged_gene_name, merged_loci, summary)
+
+head(merged_df)
+```
+
+### Go term of 21 significant genesets
+
+
+
+The 21 significant mediating gene sets identified by AdaFilter (at nominal α = 0.05) are listed below. Functional annotation via g:Profiler (`sig_GO`) reveals five broad categories:
+
+1. **Hemoglobin and erythroid programs** (k2, k4): iron handling, heme metabolism, red blood cell maturation — most directly relevant to MCH (average hemoglobin content per red blood cell).
+2. **Cell-cycle and DNA-replication programs** (k5, k8, k16, k19, k33, k39): G0/G1, S-phase, and G2/M modules — reflecting the tightly regulated cell divisions required before terminal erythroid maturation.
+3. **Autophagy and stress-adaptation programs** (k7, k44): quality control, remodeling, and stress-response processes supporting high biosynthetic demand.
+4. **Translation and proteostasis** (multiple modules): cytoplasmic translation, ribosome biogenesis, ubiquitin-dependent protein catabolism.
+5. **Core metabolism and redox biology** (multiple modules): amino acid biosynthesis, one-carbon metabolism, purine metabolism, oxygen transport, antioxidant activity.
+
+```{r}
+significant_modules <- c("k6","k8",  "k2" , "k26" ,"k3" , "k30" ,"k32" ,"k33" ,"k38" ,"k39", "k4",  "k45", "k46", "k49" ,"k7",
+"k5",  "k16" ,"k44" ,"k19")
+
+sig_GO <- readRDS("/project/xuanyao/jiaming/paper/output/mediation_analysis/MCH/flames+200kb/k50/sig_GO.rds")
+
+# sig_GO<-top10_names %>%
+#   filter(query %in% significant_modules) %>%
+#   mutate(top10_term_name = sapply(top10_term_name, paste, collapse = "; "))
+# 
+# sig_GO$summary <- sig_GO$query
+# sig_GO$summary[1] <- "cell cycle"
+# sig_GO$summary[2] <- "cell cycle"
+# sig_GO$summary[3] <- "hemoglobin"
+# sig_GO$summary[4] <- "amino acid metabolism / amino acid transport / tRNA charging / integrated stress response"
+# sig_GO$summary[5] <- "ribosome biogenesis / rRNA processing / translation / biosynthetic activity autophagy"
+# 
+# sig_GO$summary[6] <- "translation / protein trafficking / RNA localization / organelle organization / ER stress adaptation"
+# 
+# sig_GO$summary[7] <- "protein binding"
+# 
+# sig_GO$summary[8] <- "cell cycle"
+# sig_GO$summary[9] <- "ribosome biogenesis / rRNA processing / RNA metabolism / nucleotide biosynthesis"
+# sig_GO$summary[10] <- "cell cycle"
+# sig_GO$summary[11] <- "hemoglobin"
+# sig_GO$summary[12] <- "autophagy"
+# sig_GO$summary[13] <- "mitochondrial respiration / oxidative phosphorylation / electron transport chain program"
+# sig_GO$summary[14] <- "pyrimidine biosynthesis / nucleotide metabolism + RNA processing/decay"
+# sig_GO$summary[15] <- "T-cell / immune activation + translation/ribosome activity + guanine nucleotide biosynthesis"
+# sig_GO$summary[16] <- "cell cycle"
+# sig_GO$summary[17] <- "OXPHOS / mitochondrial respiration + proteostasis / ubiquitin-proteasome + translation/ribosome biogenesis"
+# sig_GO$summary[18] <- "autophagy"
+# sig_GO$summary[19] <- "cell cycle"
+
+
+```
+
+```{r}
+sig_GO[,c(1,3,4)]
+```
+
+
+
+
+## Comparison with Ota et al.
+
+To assess concordance with prior work, we compare our significant gene-set members to the three major biological axes reported by Ota et al. for MCH: hemoglobin synthesis, cell cycle, and autophagy.
+
+The chunks below define the gene lists for each Ota et al. axis and check overlap with:
+1. Our peripheral gene test set (1,297 perturbations) — how many Ota genes do we test?
+2. Genes in our significant mediating modules — do the right genes fall in the right categories?
+
+Of 13 Ota (peripheral gene - downstream regulated pathway) pair present in our test set, 11 are identified as significant by OPERA. At the gene-set level, cell-cycle module genes include G2E3, CCNF, CCNA2, H4C3, CLSPN, ATAD2, and BRIP1; hemoglobin module genes include HBA1, HBD, KLF1, SLC25A37, and EPOR.
+
+```{r,echo=T}
+haemoglobin_genes <-c(
+  "KLF1", "NPC1", "SUPT5H", "CCNF", "CAD", "CALR", "CBFA2T3",
+  "CCNA2", "CLSPN", "DNAJC24", "NDUFB7", "NUP214", "POLE",
+  "ABCB10", "(DNAJC13)", "MED13L", "MED23", "(MTOR)", "(NCOR1)",
+  "(RPTOR)", "(SALL4)"
+)
+cell_cycle_genes <- c(
+  "HSPA9", "MED14", "MED17", "SUPT5H", "SYMPK"
+)
+
+autophagy_genes <- c(
+  "AP2A1", "ATR", "EIF2B4", "EIF3E", "EIF3F", "EIF3M", "HSPA9",
+  "MED13L", "MED14", "MED17", "MED26", "MTOR", "NIPBL", "POLR2G",
+  "RNF20", "RPTOR", "RTTN", "SPRED2", "SUPT5H", "SYMPK", "TP73",
+  "TRAPPC10", "WDFY3", "CLSPN", "(EEF2)", "POLE", "BPGM", "UBE2D3",
+  "(USP10)", "(XPOT)"
+)
+
+```
+```{r}
+gene_names_clean <- sub("\\s*\\(.*\\)$", "", merged_df$merged_gene_name)
+
+gene_vector <- unique(unlist(
+  strsplit(gene_names_clean, "-(?=[A-Za-z])", perl = TRUE)
+))
+
+
+Repologle_associated_perturbations <- readRDS("/project/xuanyao/jiaming/Getting_started/data/GWAS/MCH/flames+200kb_mapping/Repologle_associated_perturbations.rds")
+
+# ensg_to_symbol already defined above from GTF
+
+# 2. 去掉 "gRNA:" 前缀，提取 ENSG ID
+ensg_ids <- sub("^gRNA:", "", Repologle_associated_perturbations)
+
+# 3. 映射成 symbol
+symbol_vector <- ensg_to_symbol[ensg_ids]
+```
+
+
+```{r}
+for (cat_name in c("Haemoglobin", "Cell_cycle", "Autophagy")) {
+  genes <- switch(cat_name,
+    Haemoglobin = haemoglobin_genes,
+    Cell_cycle  = cell_cycle_genes,
+    Autophagy   = autophagy_genes
+  )
+  
+  in_test <- intersect(genes, symbol_vector)
+  in_sig  <- intersect(genes, gene_vector)
+  
+  cat("═══════════════════════════════════════\n")
+  cat("Category:", cat_name, "\n")
+  cat("Total genes in Ota:", length(genes), "\n\n")
+  
+  cat("  In test set (symbol_vector) —", length(in_test), "genes:\n")
+  cat(" ", paste(sort(in_test), collapse = ", "), "\n\n")
+  
+  cat("  In significant set (gene_vector) —", length(in_sig), "genes:\n")
+  cat(" ", paste(sort(in_sig), collapse = ", "), "\n\n")
+}
+```
+
+
+
+```{r}
+# Pool genes from topic modules assigned to each biological category
+# (significant modules per category determined from sig_GO annotations above)
+cell_cycle_module_genes<- c(gene_modules_id$k16,gene_modules_id$k19,gene_modules_id$k33,gene_modules_id$k39,gene_modules_id$k5,gene_modules_id$k8)
+
+autophagy_module_genes <- c(gene_modules_id$k44,gene_modules_id$k7)
+
+haemoglobin_module_genes <- c(gene_modules_id$k2,gene_modules_id$k4)
+```
+
+```{r,echo=T}
+to_symbol <- function(ensg_vec) {
+  ensg_ids <- sub("^gRNA:", "", ensg_vec)
+  symbols <- ensg_to_symbol[ensg_ids]
+  # Keep ENSG ID for any genes without a symbol mapping
+  ifelse(is.na(symbols) | symbols == "NA", ensg_ids, symbols)
+}
+
+# Convert ENSG IDs (with "gRNA:" prefix) in module gene lists to gene symbols
+cell_cycle_module_symbols <- to_symbol(cell_cycle_module_genes)
+autophagy_module_symbols <- to_symbol(autophagy_module_genes)
+haemoglobin_module_symbols <- to_symbol(haemoglobin_module_genes)
+
+hemoglobin_module_genes_ota<- c(
+  "ABCB10", "CSTB", "HBA1", "HBD", "KLF1", "RTTN", "SLC25A37",
+  "TFRC", "(EPOR)", "(GYPA)"
+)
+
+cell_cycle_module_genes_ota<- c(
+  "CCNA2", "CCNF", "(CEP350)", "(G2E3)", "(H4C3)",
+  "CCNA2", "CCNF", "(DDX39A)", "(G2E3)",
+  "CCNA2", "CLSPN", "EIF2", "(ATAD2)", "(H4C3)",
+  "BRIP1", "CCNA2", "CLSPN", "EIF2", "NUP214", "POLE", "(ATAD2)"
+)
+
+
+
+hemoglobin_module_genes_ota<- c(
+  "ABCB10", "CSTB", "HBA1", "HBD", "KLF1", "RTTN", "SLC25A37",
+  "TFRC", "EPOR", "GYPA"
+)
+
+
+cell_cycle_module_genes_ota<- c(
+  "CCNA2", "CCNF", "CEP350", "G2E3", "H4C3",
+  "CCNA2", "CCNF", "DDX39A", "G2E3",
+  "CCNA2", "CLSPN", "EIF2", "ATAD2", "H4C3",
+  "BRIP1", "CCNA2", "CLSPN", "EIF2", "NUP214", "POLE", "ATAD2"
+)
+
+
+intersect(cell_cycle_module_symbols,cell_cycle_module_genes_ota)
+intersect(hemoglobin_module_genes_ota,haemoglobin_module_symbols)
+```
+
+**Below comparing the functional regulation of shared peripheral genes between OPERA and Ota**
+
+```{r}
+# ── Step 1: 获取有分类的模块列表 ──────────────────────────────────────────────
+classified_modules <- sig_GO %>%
+  filter(grepl("hemoglobin|haemoglobin|cell cycle|autophagy", summary, ignore.case = TRUE)) %>%
+  distinct(module) %>%
+  pull(module)
+
+# ── Step 2: 处理 df12，拆分连字符基因名 ───────────────────────────────────────
+gene_module_df <- merged_df %>%
+  transmute(
+    module   = as.character(module),
+    gene_raw = as.character(merged_gene_name)
+  ) %>%
+  filter(!is.na(module), !is.na(gene_raw)) %>%
+  filter(module %in% classified_modules) %>%
+  distinct(module, gene_raw) %>%
+  mutate(gene = strsplit(gene_raw, "-")) %>%
+  tidyr::unnest(gene) %>%
+  mutate(gene = trimws(sub("\\s*\\(.*", "", gene))) %>%
+  filter(gene != "") %>%
+  filter(gene %in% c(haemoglobin_genes, cell_cycle_genes, autophagy_genes)) %>%
+  distinct(gene, module)
+
+# ── Step 3: 获取每个模块的功能分类 ───────────────────────────────────────────
+get_module_function <- function(mod_name, sig_GO) {
+  rows <- sig_GO[sig_GO$module == mod_name, , drop = FALSE]
+  if (nrow(rows) == 0) return(NA_character_)
+  summ <- paste(rows$summary, collapse = " ")
+  cats <- character(0)
+  if (grepl("hemoglobin|haemoglobin", summ, ignore.case = TRUE)) cats <- c(cats, "Haemoglobin")
+  if (grepl("cell cycle",             summ, ignore.case = TRUE)) cats <- c(cats, "Cell cycle")
+  if (grepl("autophagy",              summ, ignore.case = TRUE)) cats <- c(cats, "Autophagy")
+  paste(cats, collapse = " + ")
+}
+
+# ── Step 4: 获取每个基因本身的功能分类 ───────────────────────────────────────
+get_gene_function <- function(gene_name) {
+  if (length(gene_name) == 0 || is.na(gene_name)) return("Unclassified")
+  cats <- character(0)
+  if (gene_name %in% haemoglobin_genes) cats <- c(cats, "Haemoglobin")
+  if (gene_name %in% cell_cycle_genes)  cats <- c(cats, "Cell cycle")
+  if (gene_name %in% autophagy_genes)   cats <- c(cats, "Autophagy")
+  if (length(cats) == 0) return("Unclassified")
+  paste(cats, collapse = " | ")
+}
+
+# ── Step 5: 给每个 gene-module pair 加上模块功能标签 ─────────────────────────
+gene_module_func <- gene_module_df %>%
+  rowwise() %>%
+  mutate(func = get_module_function(module, sig_GO)) %>%
+  ungroup()
+
+# ── Step 6: 汇总 ─────────────────────────────────────────────────────────────
+result_with_func <- gene_module_func %>%
+  group_by(gene) %>%
+  summarise(
+    n            = n(),
+    modules      = paste(sort(module),       collapse = ", "),
+    functions    = paste(func[order(module)], collapse = ", "),
+    func_summary = paste(sort(unique(func)), collapse = " | ")
+  ) %>%
+  arrange(desc(n), gene) %>%
+  mutate(gene_category = sapply(gene, get_gene_function))
+
+# ── Step 7: 输出 ─────────────────────────────────────────────────────────────
+cat("有 function match 的基因数:", nrow(result_with_func), "\n")
+cat("总 gene-module match 数:",   nrow(gene_module_df),   "\n\n")
+
+colnames(result_with_func)[5:6]<-c("OPERA_downstream_function","Ota_downstream_function")
+print(result_with_func, n = Inf)
+```
+
+
+
+
+## Gene–module network visualization (MCH)
+
+
+
+The MCH-specific network function `plot_gene_module_network_MCH` extends the generic `plot_gene_module_network2` with three-category biological color coding that matches the Ota et al. axes:
+- **Hemoglobin** (red #E74C3C): genes/modules involved in heme metabolism and red blood cell function
+- **Cell cycle** (yellow #F1C40F): genes/modules involved in G1/S/G2/M progression
+- **Autophagy** (blue #3498DB): genes/modules involved in stress adaptation and quality control
+- **Mixed**: nodes belonging to multiple categories receive a blended color
+- Edges connecting a gene and module that share a biological category are rendered in the matching color and bolded; non-concordant edges are grey
+
+```{r}
+plot_gene_module_network_MCH <- function(df12,
+                                      gene_modules_id = NULL,
+                                      top_n_per_module = NULL,
+                                      top_n_gene = 600,
+                                      pcap = 1e-300,
+                                      edge_by = c("none","snp_geneset"),
+                                      layout_fun = NULL,
+                                      highlight_mod = NULL,
+                                      out_pdf = NULL,
+                                      width = 12, height = 9,
+                                      label_genes = TRUE,
+                                      label_modules = TRUE,
+                                      size_scale = 0.7,
+                                      mod_size_range  = c(15, 40),
+                                      gene_size_range = c(4,  20),
+                                      highlight_genes = NULL,
+                                      sig_GO = NULL,
+                                      haemoglobin_genes = NULL,
+                                      cell_cycle_genes  = NULL,
+                                      autophagy_genes   = NULL,
+                                      unclassified_alpha = 0.3
+                                      ) {
+
+  edge_by <- match.arg(edge_by)
+  if (is.null(layout_fun)) layout_fun <- igraph::layout_with_fr
+
+  # ── 颜色辅助 ─────────────────────────────────────────────────────────────────
+  mix_hex_colors <- function(hex_vec) {
+    if (length(hex_vec) == 1) return(hex_vec)
+    rgb_mat <- grDevices::col2rgb(hex_vec)
+    avg <- rowMeans(rgb_mat)
+    grDevices::rgb(avg[1], avg[2], avg[3], maxColorValue = 255)
+  }
+
+  add_alpha <- function(col, alpha) adjustcolor(col, alpha.f = alpha)
+
+  col_haem  <- "#E74C3C"
+  col_cycle <- "#F1C40F"
+  col_auto  <- "#3498DB"
+
+  default_gene_col   <- "grey60"
+  default_module_col <- "grey10"
+
+  # ── 基因颜色 ──────────────────────────────────────────────────────────────────
+  get_gene_color <- function(raw_name) {
+    no_snp     <- trimws(sub("\\s*\\(.*", "", raw_name))
+    pure_names <- unlist(strsplit(no_snp, "-"))
+    cats <- character(0)
+    if (!is.null(haemoglobin_genes) && any(pure_names %in% haemoglobin_genes)) cats <- c(cats, col_haem)
+    if (!is.null(cell_cycle_genes)  && any(pure_names %in% cell_cycle_genes))  cats <- c(cats, col_cycle)
+    if (!is.null(autophagy_genes)   && any(pure_names %in% autophagy_genes))   cats <- c(cats, col_auto)
+    if (length(cats) == 0) return(add_alpha(default_gene_col, unclassified_alpha))
+    add_alpha(mix_hex_colors(cats), 1.0)
+  }
+
+  # ── 模块颜色 ──────────────────────────────────────────────────────────────────
+  get_module_color <- function(mod_name) {
+    if (is.null(sig_GO)) return(add_alpha(default_module_col, unclassified_alpha))
+    rows <- sig_GO[sig_GO$module == mod_name, , drop = FALSE]
+    if (nrow(rows) == 0) return(add_alpha(default_module_col, unclassified_alpha))
+    summ <- paste(rows$summary, collapse = " ")
+    cats <- character(0)
+    if (grepl("hemoglobin|haemoglobin", summ, ignore.case = TRUE)) cats <- c(cats, col_haem)
+    if (grepl("cell cycle",             summ, ignore.case = TRUE)) cats <- c(cats, col_cycle)
+    if (grepl("autophagy",              summ, ignore.case = TRUE)) cats <- c(cats, col_auto)
+    if (length(cats) == 0) return(add_alpha(default_module_col, unclassified_alpha))
+    mix_hex_colors(cats)
+  }
+
+  # ── 类别辅助（用于边着色）────────────────────────────────────────────────────
+  get_gene_categories <- function(raw_name) {
+    no_snp     <- trimws(sub("\\s*\\(.*", "", raw_name))
+    pure_names <- unlist(strsplit(no_snp, "-"))
+    cats <- character(0)
+    if (!is.null(haemoglobin_genes) && any(pure_names %in% haemoglobin_genes)) cats <- c(cats, "haem")
+    if (!is.null(cell_cycle_genes)  && any(pure_names %in% cell_cycle_genes))  cats <- c(cats, "cycle")
+    if (!is.null(autophagy_genes)   && any(pure_names %in% autophagy_genes))   cats <- c(cats, "auto")
+    cats
+  }
+
+  get_module_categories <- function(mod_name) {
+    if (is.null(sig_GO)) return(character(0))
+    rows <- sig_GO[sig_GO$module == mod_name, , drop = FALSE]
+    if (nrow(rows) == 0) return(character(0))
+    summ <- paste(rows$summary, collapse = " ")
+    cats <- character(0)
+    if (grepl("hemoglobin|haemoglobin", summ, ignore.case = TRUE)) cats <- c(cats, "haem")
+    if (grepl("cell cycle",             summ, ignore.case = TRUE)) cats <- c(cats, "cycle")
+    if (grepl("autophagy",              summ, ignore.case = TRUE)) cats <- c(cats, "auto")
+    cats
+  }
+
+  cat_to_col <- c(haem = col_haem, cycle = col_cycle, auto = col_auto)
+
+  # ── 数据处理 ─────────────────────────────────────────────────────────────────
+  d <- df12 %>%
+    dplyr::transmute(
+      module = as.character(module),
+      gene   = as.character(merged_gene_name),
+      p_snp  = pcap,
+      p_mod  = pcap
+    ) %>%
+    dplyr::filter(!is.na(module), !is.na(gene)) %>%
+    dplyr::group_by(module, gene) %>%
+    dplyr::summarise(
+      p_snp = min(p_snp, na.rm = TRUE),
+      p_mod = min(p_mod, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  if (!is.null(top_n_per_module)) {
+    d <- d %>%
+      dplyr::group_by(module) %>%
+      dplyr::arrange(p_snp, .by_group = TRUE) %>%
+      dplyr::slice_head(n = top_n_per_module) %>%
+      dplyr::ungroup()
+  }
+
+  if (!is.null(top_n_gene)) {
+    top_genes <- d %>%
+      dplyr::group_by(gene) %>%
+      dplyr::summarise(best_p = min(p_snp, na.rm = TRUE), .groups = "drop") %>%
+      dplyr::arrange(best_p) %>%
+      dplyr::slice_head(n = top_n_gene) %>%
+      dplyr::pull(gene)
+    d <- d %>% dplyr::filter(gene %in% top_genes)
+  }
+
+  # ── 权重 ─────────────────────────────────────────────────────────────────────
+  mod_tbl <- d %>%
+    dplyr::group_by(module) %>%
+    dplyr::summarise(
+      p_mod   = min(p_mod, na.rm = TRUE),
+      n_assoc = dplyr::n_distinct(gene),
+      .groups = "drop"
+    )
+
+  gene_tbl <- d %>%
+    dplyr::group_by(gene) %>%
+    dplyr::summarise(
+      p_snp   = min(p_snp, na.rm = TRUE),
+      n_assoc = dplyr::n_distinct(module),
+      .groups = "drop"
+    )
+
+  vertices <- dplyr::bind_rows(
+    mod_tbl  %>% dplyr::transmute(name = module, type = "module", weight = n_assoc),
+    gene_tbl %>% dplyr::transmute(name = gene,   type = "gene",   weight = n_assoc)
+  )
+
+  edges <- d %>% dplyr::transmute(from = module, to = gene, p_snp = p_snp)
+
+  g <- igraph::graph_from_data_frame(edges, directed = FALSE, vertices = vertices)
+
+  # ── 全量赋值基础属性 ──────────────────────────────────────────────────────────
+  igraph::V(g)$shape       <- ifelse(igraph::V(g)$type == "module", "square", "circle")
+  igraph::V(g)$label.color <- "white"
+  igraph::V(g)$frame.color <- NA
+  igraph::V(g)$color       <- ifelse(igraph::V(g)$type == "module",
+                                     add_alpha(default_module_col, unclassified_alpha),
+                                     add_alpha(default_gene_col,   unclassified_alpha))
+
+  mod_ids  <- which(igraph::V(g)$type == "module")
+  gene_ids <- which(igraph::V(g)$type == "gene")
+
+  # ── 基因着色 ──────────────────────────────────────────────────────────────────
+  for (idx in gene_ids) {
+    igraph::V(g)$color[idx] <- get_gene_color(igraph::V(g)$name[idx])
+  }
+
+  # ── 模块着色 ──────────────────────────────────────────────────────────────────
+  for (idx in mod_ids) {
+    igraph::V(g)$color[idx] <- get_module_color(igraph::V(g)$name[idx])
+  }
+
+  # ── highlight 覆盖 ───────────────────────────────────────────────────────────
+  if (!is.null(highlight_mod)) {
+    for (idx in mod_ids[igraph::V(g)$name[mod_ids] %in% highlight_mod])
+      igraph::V(g)$color[idx] <- "green3"
+  }
+  if (!is.null(highlight_genes)) {
+    for (idx in gene_ids[igraph::V(g)$name[gene_ids] %in% highlight_genes])
+      igraph::V(g)$color[idx] <- "red"
+  }
+
+  # ── 节点大小 ─────────────────────────────────────────────────────────────────
+  igraph::V(g)$size <- rep(NA_real_, igraph::vcount(g))
+
+  mod_w <- igraph::V(g)$weight[mod_ids]
+  igraph::V(g)$size[mod_ids] <- if (length(unique(mod_w)) == 1) {
+    rep(mean(mod_size_range) * size_scale, length(mod_ids))
+  } else {
+    scales::rescale(mod_w, to = mod_size_range * size_scale)
+  }
+
+  gene_w <- igraph::V(g)$weight[gene_ids]
+  igraph::V(g)$size[gene_ids] <- if (length(unique(gene_w)) == 1) {
+    rep(mean(gene_size_range) * size_scale, length(gene_ids))
+  } else {
+    scales::rescale(gene_w, to = gene_size_range * size_scale)
+  }
+
+  # ── 边 ───────────────────────────────────────────────────────────────────────
+  el        <- igraph::get.edgelist(g)
+  vtype_map <- setNames(igraph::V(g)$type, igraph::V(g)$name)
+  edge_col  <- rep("grey70", nrow(el))
+  edge_bold <- rep(FALSE,    nrow(el))
+
+  for (i in seq_len(nrow(el))) {
+    n1 <- el[i, 1]; n2 <- el[i, 2]
+    if (vtype_map[n1] == "gene") { gn <- n1; mn <- n2 } else { gn <- n2; mn <- n1 }
+    shared <- intersect(get_gene_categories(gn), get_module_categories(mn))
+    if (length(shared) > 0) {
+      edge_col[i]  <- mix_hex_colors(cat_to_col[shared])
+      edge_bold[i] <- TRUE
+    }
+  }
+
+  igraph::E(g)$color <- edge_col
+  base_w <- if (edge_by == "snp_geneset") {
+    scales::rescale(-log10(igraph::E(g)$p_snp), to = c(0.5, 4))
+  } else {
+    rep(1, igraph::ecount(g))
+  }
+  igraph::E(g)$width <- ifelse(edge_bold, pmax(base_w * 2, 3), base_w)
+
+  # ── 标签 ─────────────────────────────────────────────────────────────────────
+  igraph::V(g)$label     <- NA_character_
+  igraph::V(g)$label.cex <- ifelse(igraph::V(g)$type == "module", 0.9, 0.7)
+  if (label_modules) {
+    for (idx in mod_ids)  igraph::V(g)$label[idx] <- igraph::V(g)$name[idx]
+  }
+  if (label_genes) {
+    for (idx in gene_ids) igraph::V(g)$label[idx] <- igraph::V(g)$name[idx]
+  }
+
+  # ── 绘图 ─────────────────────────────────────────────────────────────────────
+  lay <- layout_fun(g)
+  if (!is.null(out_pdf)) grDevices::pdf(out_pdf, width = width, height = height)
+
+  plot(g, layout = lay, vertex.label.dist = 0, edge.curved = 0)
+
+  # ── 获取绘图坐标范围，用于定位图例 ──────────────────────────────────────────
+  usr     <- graphics::par("usr")          # c(x1, x2, y1, y2)
+  x_left  <- usr[1] + 0.02 * (usr[2] - usr[1])
+  x_right <- usr[2] - 0.02 * (usr[2] - usr[1])
+  y_bot   <- usr[3] + 0.02 * (usr[4] - usr[3])
+
+  # ── 节点类别图例 ─────────────────────────────────────────────────────────────
+  leg_labels <- c(
+    "Haemoglobin", "Cell cycle", "Autophagy",
+    "Cycle + Haem", "Cycle + Auto", "Haem + Auto", "All three",
+    "Unclassified (gene)", "Unclassified (module)"
+  )
+  leg_cols <- c(
+    col_haem, col_cycle, col_auto,
+    mix_hex_colors(c(col_cycle, col_haem)),
+    mix_hex_colors(c(col_cycle, col_auto)),
+    mix_hex_colors(c(col_haem,  col_auto)),
+    mix_hex_colors(c(col_haem, col_cycle, col_auto)),
+    add_alpha(default_gene_col,   unclassified_alpha),
+    add_alpha(default_module_col, unclassified_alpha)
+  )
+
+  graphics::legend(
+    x         = x_left,
+    y         = y_bot,
+    xjust     = 0, yjust = 0,
+    legend    = leg_labels,
+    pt.bg     = leg_cols,
+    col       = leg_cols,
+    pch       = c(rep(19, 8), 15),
+    pt.cex    = 2.2,
+    cex       = 1.1,
+    bty       = "o",
+    box.col   = "grey30",
+    box.lwd   = 1.2,
+    bg        = "white",
+    title     = expression(bold("Category")),
+    title.col = "black",
+    title.cex = 1.2
+  )
+
+  # ── 边类别图例 ───────────────────────────────────────────────────────────────
+  graphics::legend(
+    x         = x_right,
+    y         = y_bot,
+    xjust     = 1, yjust = 0,
+    legend    = c("Haemoglobin (gene–module)", "Cell cycle (gene–module)",
+                  "Autophagy (gene–module)",   "No shared category"),
+    col       = c(col_haem, col_cycle, col_auto, "grey70"),
+    lwd       = c(4, 4, 4, 1.5),
+    lty       = 1,
+    cex       = 1.1,
+    bty       = "o",
+    box.col   = "grey30",
+    box.lwd   = 1.2,
+    bg        = "white",
+    title     = expression(bold("Edge (shared category)")),
+    title.col = "black",
+    title.cex = 1.2
+  )
+
+  if (!is.null(out_pdf)) grDevices::dev.off()
+  invisible(g)
+}
+```
+
+
+The bipartite network connects peripheral gene nodes (circles) to topic module nodes (squares). Color coding:
+- **Red** (hemoglobin), **Yellow** (cell cycle), **Blue** (autophagy) — matching the three biological axes described by Ota et al.
+- Mixed colors indicate modules/genes belonging to multiple categories.
+- Unclassified nodes are shown in grey with reduced opacity.
+- Edge color reflects the shared biological category between gene and module; bold edges highlight concordant gene–module pairs.
+- Node size scales with the number of modules (for genes) or associated peripheral genes (for modules).
+
+
+
+```{r,fig.width=30,fig.height=30}
+plot_gene_module_network_MCH(
+  df12              = merged_df,
+  sig_GO            = sig_GO,          # 含 module + summary 列
+  haemoglobin_genes = haemoglobin_genes,
+  cell_cycle_genes  = cell_cycle_genes,
+  autophagy_genes   = autophagy_genes,
+  top_n_gene        = 800,
+ size_scale = 0.3,
+  edge_by           = "none",
+ unclassified_alpha =0.3
+)
+```
+
+
+```{r,include=F}
+g <- plot_gene_module_network_MCH(
+  df12              = merged_df,
+  sig_GO            = sig_GO,
+  haemoglobin_genes = haemoglobin_genes,
+  cell_cycle_genes  = cell_cycle_genes,
+  autophagy_genes   = autophagy_genes,
+  top_n_gene        = 800,
+  size_scale        = 0.3,
+  edge_by           = "none",
+  unclassified_alpha = 0.3,
+  out_pdf           = NULL   # 不输出PDF，直接画到PNG设备
+)
+
+# ↓ 只需要这两行，不要再单独 plot(g)
+png("/project/xuanyao/jiaming/Getting_started/data/GWAS/MCH/flames+200kb_mapping/gene_module_network.png",
+    width = 12000, height = 12000, res = 500)
+# 重新调用函数并传入 out_pdf=NULL，让函数内部画到已打开的PNG设备
+plot_gene_module_network_MCH(
+  df12              = merged_df,
+  sig_GO            = sig_GO,
+  haemoglobin_genes = haemoglobin_genes,
+  cell_cycle_genes  = cell_cycle_genes,
+  autophagy_genes   = autophagy_genes,
+  top_n_gene        = 800,
+  size_scale        = 0.3,
+  edge_by           = "none",
+  unclassified_alpha = 0.3,
+  out_pdf           = NULL
+)
+dev.off()
+```
+
+
+
+## Gene-level evidence within significant mediating modules
+
+To verify that the significant mediation signals reflect genuine gene-set–level effects (rather than being driven by a small number of outlier genes), we examine the distribution of gene-level MCH p-values within each significant (perturbation, module) pair.
+
+For each pair, we estimate **π₁** (the proportion of true non-null associations) using Storey's method: π₁ = 1 − π₀, where π₀ is estimated from the fraction of p-values > 0.5. If mediation were driven only by one or two extreme genes, the majority of p-values within the module would be uniform and π₁ would be low. Instead, we observe elevated π₁ across genes in significant modules, indicating that multiple genes within the same co-regulated program contribute to the MCH signal.
+
+This analysis also provides empirical support for the **omnigenic model**: each significant gene set is associated with many distinct peripheral gene perturbations, rather than being regulated by only a few specific genes.
+
+Key comparison with Ota et al.: of 13 Ota et al. MCH-pathway genes in our 1,297-gene test set (CLSPN, SPRED2, CAD, POLE, CBFA2T3, CCNA2, KLF1, EIF3F, CALR, EIF2B4, ABCB10, ATR, SYMPK), **11 are identified as significant peripheral genes by OPERA**, and many appear as members of the significant gene-set modules.
+
+```{r}
+
+filtered_list_50 <- readRDS("/project/xuanyao/jiaming/Getting_started/data/repologle/topic_geneset/flames+200kb/de_50_0.01_2_0.5.rds")
+genewise_p_value <- readRDS("/project/xuanyao/jiaming/paper/output/snake/repologle_MCH/flames+200kb/K50/3000_t_ACAT_resample/p_values/genewise_p_value.rds")
+genewise_p_value[genewise_p_value==0] <- 1e-100
+
+
+# ============================================================
+# Step 1: 找 key SNPs（与 >5 个 module 有联系的 SNP）
+# ============================================================
+
+snp_module_count <- dfl2 %>%
+  group_by(snp) %>%
+  summarise(n_modules = n_distinct(module)) %>%
+  arrange(desc(n_modules))
+
+key_snps <- snp_module_count %>%
+  filter(n_modules > 0) %>%
+  pull(snp)
+
+# 报告比例
+total_snps <- n_distinct(dfl2$snp)
+n_key_snps <- length(key_snps)
+
+cat("Key SNPs数量:", n_key_snps, "\n")
+cat("总SNP数量:", total_snps, "\n")
+cat("Key SNP比例:", round(n_key_snps / total_snps * 100, 2), "%\n")
+
+# ============================================================
+# Step 2: 对每个 key SNP，找联系的 module，再找 module 中的基因
+# 然后做 Bonferroni 校正，统计 significant genes
+# ============================================================
+
+# genewise_p_value 格式：行是 SNP，列是 gene
+# 先转成长格式方便操作
+p_long <- genewise_p_value %>%
+  as.data.frame() %>%
+  rownames_to_column("snp") %>%
+  pivot_longer(-snp, names_to = "gene_id", values_to = "p_value")
+
+# Bonferroni 校正阈值（按每个 snp-module 组合的基因数校正）
+library(qvalue)
+
+results_list <- list()
+pval_list    <- list()   # 新增：储存每个 snp-module 的 p value 向量
+
+# 设为 NULL 则计算所有 guide；设为具体 guide ID 则只计算该 guide
+target_guide <- "gRNA:ENSG00000179115"
+if (!is.null(target_guide)) key_snps <- intersect(key_snps, target_guide)
+
+for (i in seq_along(key_snps)) {
+  s <- key_snps[i]
+  cat(sprintf("Processing SNP %d/%d: %s\n", i, length(key_snps), s))
+  
+  modules_for_snp <- dfl2 %>%
+    filter(snp == s) %>%
+    pull(module) %>%
+    unique()
+  
+  for (m in modules_for_snp) {
+    genes_in_module <- filtered_list_50[[m]]
+    if (is.null(genes_in_module) || length(genes_in_module) == 0) next
+    
+    p_subset <- p_long %>%
+      filter(snp == s, gene_id %in% genes_in_module) %>%
+      filter(!is.na(p_value))
+    if (nrow(p_subset) == 0) next
+    
+    key <- paste(s, m, sep = "_")
+    
+    # ── 原有：计算 pi1 ──────────────────────────────────────
+    pi1_val <- tryCatch({
+      qobj <- qvalue(p = p_subset$p_value)
+      1 - qobj$pi0
+    }, error = function(e) NA_real_)
+    
+    results_list[[key]] <- data.frame(
+      snp               = s,
+      module            = m,
+      n_genes_in_module = nrow(p_subset),
+      pi1               = round(pi1_val, 4)
+    )
+    
+    # ── 新增：保存 p value 向量 ──────────────────────────────
+    pval_list[[key]] <- p_subset %>%
+      dplyr::select(gene_id, p_value)          # 保留基因名，方便后续对照
+  }
+}
+
+results_df  <- bind_rows(results_list)
+
+# pval_df：长格式，包含 snp、module、gene_id、p_value 四列
+pval_df <- bind_rows(
+  lapply(names(pval_list), function(k) {
+    parts <- strsplit(k, "_")[[1]]
+    # key 格式是 "snp_module"，snp 本身可能含下划线，所以用 results_df 对应
+    pval_list[[k]] %>%
+      mutate(snp_module_key = k)
+  })
+) %>%
+  left_join(
+    results_df %>% dplyr::select(snp, module) %>%
+      mutate(snp_module_key = paste(snp, module, sep = "_")),
+    by = "snp_module_key"
+  ) %>%
+  dplyr::select(snp, module, gene_id, p_value)
+
+
+```
+
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+plot_guide_heatmap <- function(guide_id, pval_df) {
+  
+  df <- pval_df %>% filter(snp == guide_id)
+  
+  all_genes   <- unique(df$gene_id)
+  all_modules <- unique(df$module)
+  
+  # 构建完整 module x gene 矩阵
+  full_df <- expand.grid(module = all_modules, gene_id = all_genes, stringsAsFactors = FALSE) %>%
+    left_join(df %>% dplyr::select(module, gene_id, p_value), by = c("module", "gene_id")) %>%
+    mutate(has_value = !is.na(p_value))
+  
+  # ── 基因排序：按 module membership 聚集 ──────────────────
+  # 每个 gene 的"primary module"= 它出现在哪些 module 里
+  # 策略：先按 module 数量分组，再按最小 p_value 的 module 排序
+gene_order <- df %>%
+    filter(!is.na(p_value)) %>%           # 先去掉 NA
+    mutate(p_value = as.numeric(p_value)) %>%  # 确保是 numeric，不是 list
+    group_by(gene_id) %>%
+    slice_min(p_value, n = 1, with_ties = FALSE) %>%  # 替换 arrange + slice(1)
+    ungroup() %>%
+    arrange(module, p_value) %>%
+    pull(gene_id)
+  
+  # 有些 gene 可能只在 full_df 里（expand.grid 补全的），补到末尾
+  remaining_genes <- setdiff(all_genes, gene_order)
+  gene_order_full <- c(gene_order, remaining_genes)
+  
+  # ── Module 排序：按各自基因数量降序 ──────────────────────
+  module_order <- df %>%
+    group_by(module) %>%
+    summarise(n_genes = n_distinct(gene_id), .groups = "drop") %>%
+    arrange(desc(n_genes)) %>%
+    pull(module)
+  
+  # 应用排序
+  full_df <- full_df %>%
+    mutate(
+      gene_id = factor(gene_id, levels = gene_order_full),
+      module  = factor(module,  levels = module_order)
+    )
+  
+  # ── 添加 module 分隔线位置 ────────────────────────────────
+  # 统计每个 module 在 x 轴上占据的基因位置，画竖线分隔
+  module_boundaries <- df %>%
+    mutate(gene_id = factor(gene_id, levels = gene_order_full)) %>%
+    group_by(module) %>%
+    summarise(
+      max_pos = max(as.integer(gene_id), na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(max_pos) %>%
+    # 边界线画在每个 module 最后一个基因之后 0.5 处
+    mutate(xintercept = max_pos + 0.5) %>%
+    filter(xintercept < length(gene_order_full) + 0.5)  # 去掉最右边界
+  
+  ggplot(full_df, aes(x = gene_id, y = module)) +
+    geom_tile(data = filter(full_df, !has_value), fill = "grey92", color = NA) +
+    geom_tile(data = filter(full_df, has_value),  aes(fill = p_value), color = NA) +
+    # module 分隔竖线
+    geom_vline(
+      data        = module_boundaries,
+      aes(xintercept = xintercept),
+      color       = "grey40",
+      linewidth   = 0.4,
+      linetype    = "dashed",
+      inherit.aes = FALSE
+    ) +
+    scale_fill_gradient(
+      low      = "red",
+      high     = "white",
+      limits   = c(0, 1),
+      name     = "p-value",
+      na.value = "grey92"
+    ) +
+    labs(
+      title = paste("Guide:", guide_id),
+      x     = "Gene (ordered by module membership)",
+      y     = "Module"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x  = element_blank(),
+      axis.ticks.x = element_blank(),
+      panel.grid   = element_blank(),
+      plot.title   = element_text(hjust = 0.5)
+    )
+}
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+plot_module_qqplot <- function(guide_id, pval_df) {
+  
+  df <- pval_df %>% filter(snp == guide_id)
+  
+  all_modules <- unique(df$module)
+  
+  # 为每个 module 生成 QQ plot 数据
+  qq_df <- lapply(all_modules, function(mod) {
+    p_vals <- df %>%
+      filter(module == mod) %>%
+      pull(p_value) %>%
+      na.omit() %>%
+      sort()
+    
+    n <- length(p_vals)
+    if (n == 0) return(NULL)
+    
+    expected <- -log10((seq_len(n)) / (n + 1))
+    observed <- -log10(p_vals)
+    
+    data.frame(
+      module   = mod,
+      expected = expected,
+      observed = observed
+    )
+  }) %>%
+    bind_rows()
+  
+  # 计算 lambda 和 pi1 per module
+  stats_df <- df %>%
+    group_by(module) %>%
+    summarise(
+      p_vals = list(na.omit(p_value)),
+      .groups = "drop"
+    ) %>%
+    rowwise() %>%
+    mutate(
+      n = length(p_vals),
+      
+      # lambda：基因组膨胀因子，用 p-value 对应的卡方统计量中位数估算
+      lambda = ifelse(
+        n > 1,
+        round(
+          median(qchisq(p_vals, df = 1, lower.tail = FALSE), na.rm = TRUE) /
+            qchisq(0.5, df = 1, lower.tail = FALSE),
+          3
+        ),
+        NA_real_
+      ),
+      
+      # pi1：真实信号比例 = 1 - pi0
+      # 用 Storey 方法估算 pi0：在 p > lambda_thresh 区域，p-value 近似均匀分布
+      # pi0 ≈ #{p > 0.5} / (n * 0.5)，lambda_thresh 取 0.5
+      pi1 = ifelse(
+        n > 1,
+        round(
+          1 - sum(p_vals > 0.5) / (n * 0.5),
+          3
+        ),
+        NA_real_
+      ),
+      pi1 = pmax(0, pmin(1, pi1)),   # 截断到 [0, 1]
+      
+      label = paste0("λ = ", lambda, "\nπ₁ = ", pi1)
+    ) %>%
+    ungroup()
+  
+  # 把 label 加入 qq_df 用于 facet 内标注
+  label_df <- qq_df %>%
+    group_by(module) %>%
+    summarise(
+      x_pos = 0,
+      y_pos = max(observed, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    left_join(stats_df %>% dplyr::select(module, label), by = "module")
+  
+  ggplot(qq_df, aes(x = expected, y = observed)) +
+    geom_abline(intercept = 0, slope = 1,
+                color = "red", linetype = "dashed", linewidth = 0.6) +
+    geom_point(alpha = 0.6, size = 0.8, color = "steelblue") +
+    geom_text(
+      data    = label_df,
+      aes(x = x_pos, y = y_pos, label = label),
+      hjust   = 0, vjust = 1,
+      size    = 2.8, color = "black",
+      inherit.aes = FALSE
+    ) +
+    facet_wrap(~ module, scales = "free") +
+    labs(
+      title = paste("QQ Plot by Module — Guide:", guide_id),
+      x     = expression(Expected ~ -log[10](p)),
+      y     = expression(Observed ~ -log[10](p))
+    ) +
+    theme_minimal() +
+    theme(
+      strip.text  = element_text(face = "bold", size = 9),
+      panel.grid  = element_blank(),
+      axis.line   = element_line(color = "grey50"),
+      plot.title  = element_text(hjust = 0.5)
+    )
+}
+
+```
+
+```{r}
+plot_guide_heatmap("gRNA:ENSG00000179115", pval_df)
+plot_module_qqplot("gRNA:ENSG00000179115", pval_df)
+```
+
+
+```{r,include=F}
+
+results_key <- results_df %>%
+  filter(snp %in% key_snps, !is.na(pi1))
+
+pi1_all <- results_df$pi1[!is.na(results_df$pi1)]
+pi1_key <- results_key$pi1
+
+# 先画 all SNPs（freq=FALSE 直接输出密度，不要手动改 $density）
+hist(pi1_all,
+     breaks = 200,
+     freq   = FALSE,
+     col    = rgb(0.2, 0.4, 0.8, 0.5),
+     border = NA,
+     xlim   = c(0, 1),
+     xlab   = "Pi1",
+     ylab   = "Density",
+     main   = "Pi1 distribution: all SNPs vs key SNPs")
+
+# 叠加 key SNPs
+hist(pi1_key,
+     breaks = 200,
+     freq   = FALSE,
+     col    = rgb(0.9, 0.3, 0.2, 0.5),
+     border = NA,
+     add    = TRUE)
+
+legend("topright",
+       legend = c("All peripheral genes", "Key peripheral genes (>5 modules)"),
+       fill   = c(rgb(0.2, 0.4, 0.8, 0.5),
+                  rgb(0.9, 0.3, 0.2, 0.5)),
+       border = NA,
+       bty    = "n")
+```
+
+
+
+## Negative control: non-targeting perturbations
+
+To assess calibration of the mediation framework, we repeat the full pipeline using **514 non-targeting perturbations** from the Replogle dataset. Non-targeting perturbations do not disrupt any gene, so they should not exhibit systematic associations with MCH. The resulting 24,158 negative-control (perturbation, gene-set, MCH) triples serve as an empirical null.
+
+Under a 5% FDR threshold applied to the AdaFilter decisions from this negative-control run, only 18 pairs (0.07%) are called significant — demonstrating excellent calibration and strong control of false positives across the full pipeline.
+
+```{r}
+library(data.table)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(heavytailcombtest)
+
+# -----------------------------
+# 0) Read inputs
+# Non-targeting perturbation IDs are indexed from grna_names.rds
+# using the logical vector in non_targeting_guide.rds
+# -----------------------------
+df <- fread("/project/xuanyao/jiaming/Getting_started/data/geneset_to_trait/MCH/MCH_summary.tsv")
+df2 <- df[grepl("M1.01", df$Name), ]
+
+Repologle_associated_perturbation <- readRDS("/project/xuanyao/jiaming/Getting_started/data/repologle/grna_names.rds")[readRDS("/project/xuanyao/jiaming/Getting_started/data/repologle/non_targeting_guide.rds")]
+
+
+
+discovery_pairs_cis <- readRDS("/project/xuanyao/jiaming/Getting_started/data/repologle/discovery_pairs_cis.rds")
+
+
+gene_modules_id <- readRDS("/project/xuanyao/jiaming/Getting_started/data/repologle/topic_geneset/flames+200kb/de_50_0.01_2_0.5.rds")
+
+
+
+
+# -----------------------------
+# 1) Build pv_map from df2
+# -----------------------------
+gene_id <- str_extract(df2$Name, "(?<=\\()[^()]+(?=\\))")
+
+lookup <- df2 %>%
+  mutate(ID = gene_id) %>%
+  filter(!is.na(ID), !is.na(p_value)) %>%
+  group_by(ID) %>%
+  summarise(p_value = min(p_value), .groups = "drop")
+
+pv_map <- setNames(lookup$p_value, lookup$ID)
+
+
+# -----------------------------
+# 2) Helpers
+# -----------------------------
+clean_p <- function(p) {
+  p <- as.numeric(p)
+  p[is.na(p) | p <= 0] <- NA
+  p
+}
+
+safe_comb <- function(p) {
+  p <- as.numeric(p)
+  p <- p[!is.na(p) & p > 0 & p <= 1]
+  if (length(p) == 0) return(NA_real_)
+  if (length(p) == 1) return(p)
+
+  combination.test(
+    p,
+    weights = NA,
+    method = "Cauchy",
+    tail.idx = 1
+  )
+}
+
+safe_comb_fisher <- function(p) {
+  p <- as.numeric(p)
+  p <- p[!is.na(p) & p > 0 & p <= 1]
+  if (length(p) == 0) return(NA_real_)
+  if (length(p) == 1) return(p)
+
+  stat <- -2 * sum(log(p))
+  stats::pchisq(stat, df = 2 * length(p), lower.tail = FALSE)
+}
+
+
+# -----------------------------
+# 3) Make filtered modules per perturbation (and record n_removed)
+# -----------------------------
+make_filtered_modules <- function(gene_symbol, gene_modules_id, pairs_df) {
+  target_name <- sub("^gRNA:", "", gene_symbol)
+  # print(target_name)
+  # print(pairs_df$grna_target)
+
+  ids_to_remove <- unique(pairs_df$response_id[pairs_df$grna_target == target_name])
+
+  filtered_modules <- lapply(gene_modules_id, function(mod_ids) {
+    setdiff(mod_ids, ids_to_remove)
+  })
+
+  list(
+    modules   = filtered_modules,
+    n_removed = length(ids_to_remove)
+  )
+}
+
+filtered_by_perturbation <- setNames(
+  lapply(
+    Repologle_associated_perturbation,
+    make_filtered_modules,
+    gene_modules_id = gene_modules_id,
+    pairs_df = discovery_pairs_cis
+  ),
+  Repologle_associated_perturbation
+)
+
+
+# -----------------------------
+# 4) Compute module-level combined p-values per perturbation
+#    (and add n_removed into module_results)
+# -----------------------------
+compute_for_one_pert <- function(pert) {
+  obj <- filtered_by_perturbation[[pert]]
+  gene_modules_id_pert <- obj$modules
+  n_removed <- obj$n_removed
+
+  # module -> p-values vector under this perturbation
+  module_pvals <- lapply(gene_modules_id_pert, function(genes) {
+    p <- pv_map[genes]
+    names(p) <- genes
+    p[!is.na(p)]
+  })
+
+  # combine within each module
+  p_acat <- map_dbl(module_pvals, ~ {
+    p <- clean_p(.x)
+    if (!length(p)) return(NA_real_)
+    as.numeric(safe_comb(p))
+  })
+
+  p_fisher <- map_dbl(module_pvals, ~ {
+    p <- clean_p(.x)
+    if (!length(p)) return(NA_real_)
+    as.numeric(safe_comb_fisher(p))
+  })
+
+  tibble(
+    snp       = pert,
+    n_removed = n_removed, 
+    module    = names(module_pvals),
+    n_genes   = lengths(gene_modules_id_pert),
+    n_matched = sapply(module_pvals, function(v) sum(!is.na(v))),
+    p_acat    = p_acat,
+    p_fisher  = p_fisher
+  )
+}
+
+module_results <- map_dfr(Repologle_associated_perturbation, compute_for_one_pert)
+
+
+```
+
+```{r}
+library(tidyr)
+library(dplyr)
+library(tibble)
+
+# Load the same OPERA p-value matrix used for the primary MCH analysis.
+# For the negative control we use only the non-targeting rows (snp_geneset_p_value_control).
+snp_geneset_p_value<- readRDS("/project/xuanyao/jiaming/paper/output/snake/repologle_MCH/flames+200kb/K50/3000_t_ACAT_resample/p_values/geneset_p_value.rds")
+snp_geneset_p_value_test <- snp_geneset_p_value[which(grepl("ENSG",rownames(snp_geneset_p_value))),]
+snp_geneset_p_value_control <- snp_geneset_p_value[which(grepl("non",rownames(snp_geneset_p_value))),]
+df1_long <- snp_geneset_p_value_control %>%
+  as.data.frame() %>%
+  rownames_to_column("snp") %>%      # 这里真正把 rownames 变成一列 snp
+  pivot_longer(
+    -snp,
+    names_to  = "module",
+    values_to = "p_snp_geneset"
+  )
+
+## 2. 模块层面的表，只保留需要的列
+df2 <- module_results %>%
+  dplyr::select(module, p_fisher, everything())
+
+## 3. 按 module 合并，再调整列顺序
+merged <- df1_long %>%
+  left_join(df2, by = c("snp", "module")) %>%  # 关键改动
+  relocate(snp, module, p_snp_geneset, p_fisher)
+
+
+# library(dplyr)
+# 
+# df1 <- as.data.frame(snp_geneset_p_value)
+# df1$snp <- rownames(df1)
+# 
+# df1_long <- df1 %>%
+#   pivot_longer(-snp, names_to = "module", values_to = "p_snp_geneset")
+# 
+# ## 图二：geneset_acat_pvals_M1.0001（列：module, p_acat）
+# df2 <- geneset_acat_pvals_M1.0001 %>%
+#   dplyr::select(module, p_fisher)
+# 
+# merged <- df1_long %>%
+#   left_join(df2, by = "module") %>%
+#   relocate(snp, module, p_snp_geneset, p_fisher)
+# 
+# 
+
+X <- merged[,c(3,4)]
+
+library(adaFilter)
+
+result <- adaFilter(X, r = 2,alpha=0.05)
+
+merged$decision <- result$decision
+colnames(merged)[c(3,4)] <- c("snp_geneset","geneset_trait")
+
+head(merged[merged$decision==1,])
+```
+
+# Asthma analysis (Nadig dataset)
+
+The same three-stage mediation framework is applied to **asthma** (GWAS: GCST010043) using the **Nadig** Perturb-seq dataset (T cells). GWAS loci were mapped to candidate effector genes using both a 200 kb window and FLAMES, yielding **75 asthma-relevant perturbations**.
+
+Topic modeling was applied to perturbation-receiving cells (split-sample design as for MCH), and the resulting gene sets were used as candidate mediators. Because the Nadig dataset is smaller and from a different cell type (immune rather than erythroid), a different optimal number of topics (K = 20 or K = 10/15 for different locus-mapping strategies) was used. The analysis demonstrates that the framework generalizes across traits with distinct genetic architectures, perturbation coverage scales, and cellular contexts.
+
+## Asthma, FLAMES / 200 kb locus mapping, K = 20
+
+```{r}
+library(gprofiler2)
+ gene_modules_id <- readRDS("/project/xuanyao/jiaming/Getting_started/data/Nadig/topic_geneset/flames_200kb/de_20_0.01_2_0.5.rds")
+
+ de_10_0.01_2_0.5 <-gene_modules_id
+
+gene_sets <- lapply(de_10_0.01_2_0.5, function(x) unique(as.character(x)))
+
+# gene_sets <- lapply(de_10_0.01_2_0.5 , function(x) unique(as.character(x)))
+
+# 建议给每个 set 一个名字（没有就补上）
+if (is.null(names(gene_sets))) names(gene_sets) <- paste0("set_", seq_along(gene_sets))
+
+res <- gost(
+  query = gene_sets,                 # list of 100 gene vectors
+  organism = "hsapiens",
+  multi_query = TRUE,
+  correction_method = "fdr",
+  user_threshold = 0.05,
+  sources = c("GO:BP","GO:MF","KEGG")
+)
+
+
+
+# geneset 名字：如果你有 gene_sets 的 names 就用它；否则自动生成
+gs_names <- names(gene_sets)
+if (is.null(gs_names)) gs_names <- paste0("set_", seq_along(res$result$significant[[1]]))
+
+# GO term 名字：用 term_id 或 term_name（建议 term_id 更稳定）
+go_names <- paste0(res$result$source, ":", res$result$term_id)
+# 如果你更想用可读名字：
+# go_names <- paste0(res$result$source, ":", res$result$term_name)
+
+# 1) list -> 矩阵：每列一个 term，每行一个 geneset
+sig_term_by_set <- do.call(cbind, res$result$significant)
+storage.mode(sig_term_by_set) <- "logical"
+
+# 2) 转成“geneset(行) × term(列)”的 index matrix
+idx_mat <- sig_term_by_set  # 现在行=geneset, 列=term（通常就是这个方向）
+rownames(idx_mat) <- gs_names
+colnames(idx_mat) <- go_names
+
+
+# 如果你发现方向反了（极少数情况），就用这一句修正：
+# idx_mat <- t(idx_mat)
+
+library(dplyr)
+library(tidyr)
+
+go_tbl <- as_tibble(res$result)
+
+# geneset 名称（如果你有 names(gene_sets) 就用它；否则自动生成）
+G <- length(go_tbl$p_values[[1]])
+gs_names <- names(gene_sets)
+if (is.null(gs_names) || length(gs_names) != G) gs_names <- paste0("set_", seq_len(G))
+
+# 展开：term × geneset 的长表
+go_long <- go_tbl %>%
+  mutate(
+    query   = list(gs_names),
+    p_value = p_values,
+    sig     = significant       # significant 列也是 list，记录每个 geneset 是否显著
+  ) %>%
+  dplyr::select(source, term_id, term_name, query, p_value, sig) %>%
+  unnest(c(query, p_value, sig)) %>%
+  filter(sig == TRUE)  
+
+# 每个 geneset 取 top10（p_value 最小）
+top10_tbl <- go_long %>%
+  group_by(query) %>%
+  arrange(p_value, .by_group = TRUE) %>%
+  ungroup()
+
+# 你想要的：每个 geneset 的 top10 term_name（以及可选的 p_value）
+top10_names <- top10_tbl %>%
+  group_by(query) %>%
+  summarise(top10_term_name = list(term_name), .groups = "drop")
+
+
+
+# 注意！！！！！！！！！！！！！！！是按 1， 10 ，11 等排序
+```
+
+```{r}
+top10_names
+
+```
+
+
+
+
+### Geneset–trait associations and AdaFilter mediation test (Asthma, K20, flames_200kb)
+
+Same pipeline as MCH: Fisher aggregation of gene-level asthma burden-test p-values within topic modules (with cis-gene exclusion), joined to OPERA gene→gene-set p-values, and tested jointly with AdaFilter. Note: `alpha=0.1` is used here given the smaller number of perturbations (75 vs. 1,297 for MCH), which reduces statistical power.
+
+```{r}
+library(data.table)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(heavytailcombtest)
+
+# -----------------------------
+# 0) Read inputs
+# -----------------------------
+df <- fread("/project/xuanyao/jiaming/Getting_started/data/geneset_to_trait/asthma/asthma.tsv")
+df2 <- df[grepl("M1.01", df$Name), ]
+
+Nadig_associated_perturbation <- readRDS("/project/xuanyao/jiaming/Getting_started/data/GWAS/asthma/GCST010043/flames_200kb/Nadig_associated_perturbation_flames_200kb.rds")
+
+
+
+discovery_pairs_cis <- readRDS("/project/xuanyao/jiaming/Getting_started/data/Nadig/discovery_pairs_cis.rds")
+
+
+ gene_modules_id <- readRDS("/project/xuanyao/jiaming/Getting_started/data/Nadig/topic_geneset/flames_200kb/de_20_0.01_2_0.5.rds")
+
+all_measured_genes <- readRDS("/project/xuanyao/jiaming/Getting_started/data/Nadig/all_measured_genes.rds")
+
+# 只保留测到的 genes
+gene_modules_id <- lapply(gene_modules_id, function(vec) intersect(vec, all_measured_genes))
+
+
+# -----------------------------
+# 1) Build pv_map from df2
+# -----------------------------
+gene_id <- str_extract(df2$Name, "(?<=\\()[^()]+(?=\\))")
+
+lookup <- df2 %>%
+  mutate(ID = gene_id) %>%
+  filter(!is.na(ID), !is.na(p_value)) %>%
+  group_by(ID) %>%
+  summarise(p_value = min(p_value), .groups = "drop")
+
+pv_map <- setNames(lookup$p_value, lookup$ID)
+
+
+# -----------------------------
+# 2) Helpers
+# -----------------------------
+clean_p <- function(p) {
+  p <- as.numeric(p)
+  p[is.na(p) | p <= 0] <- NA
+  p
+}
+
+safe_comb <- function(p) {
+  p <- as.numeric(p)
+  p <- p[!is.na(p) & p > 0 & p <= 1]
+  if (length(p) == 0) return(NA_real_)
+  if (length(p) == 1) return(p)
+
+  combination.test(
+    p,
+    weights = NA,
+    method = "Cauchy",
+    tail.idx = 1
+  )
+}
+
+safe_comb_fisher <- function(p) {
+  p <- as.numeric(p)
+  p <- p[!is.na(p) & p > 0 & p <= 1]
+  if (length(p) == 0) return(NA_real_)
+  if (length(p) == 1) return(p)
+
+  stat <- -2 * sum(log(p))
+  stats::pchisq(stat, df = 2 * length(p), lower.tail = FALSE)
+}
+
+
+# -----------------------------
+# 3) Make filtered modules per perturbation (and record n_removed)
+# -----------------------------
+make_filtered_modules <- function(gene_symbol, gene_modules_id, pairs_df) {
+  target_name <- paste0("tar-",gene_symbol)
+
+  ids_to_remove <- unique(pairs_df$response_id[pairs_df$grna_target == target_name])
+
+  filtered_modules <- lapply(gene_modules_id, function(mod_ids) {
+    setdiff(mod_ids, ids_to_remove)
+  })
+
+  list(
+    modules   = filtered_modules,
+    n_removed = length(ids_to_remove)
+  )
+}
+
+filtered_by_perturbation <- setNames(
+  lapply(
+    Nadig_associated_perturbation,
+    make_filtered_modules,
+    gene_modules_id = gene_modules_id,
+    pairs_df = discovery_pairs_cis
+  ),
+  Nadig_associated_perturbation
+)
+
+
+# -----------------------------
+# 4) Compute module-level combined p-values per perturbation
+#    (and add n_removed into module_results)
+# -----------------------------
+compute_for_one_pert <- function(pert) {
+  obj <- filtered_by_perturbation[[pert]]
+  gene_modules_id_pert <- obj$modules
+  n_removed <- obj$n_removed
+
+  # module -> p-values vector under this perturbation
+  module_pvals <- lapply(gene_modules_id_pert, function(genes) {
+    p <- pv_map[genes]
+    names(p) <- genes
+    p[!is.na(p)]
+  })
+
+  # combine within each module
+  p_acat <- map_dbl(module_pvals, ~ {
+    p <- clean_p(.x)
+    if (!length(p)) return(NA_real_)
+    as.numeric(safe_comb(p))
+  })
+
+  p_fisher <- map_dbl(module_pvals, ~ {
+    p <- clean_p(.x)
+    if (!length(p)) return(NA_real_)
+    as.numeric(safe_comb_fisher(p))
+  })
+
+  tibble(
+    snp       = pert,
+    n_removed = n_removed,  # ✅ 每个 perturbation 的 ids_to_remove 数量（复制到每一行 module）
+    module    = names(module_pvals),
+    n_genes   = lengths(gene_modules_id_pert),
+    n_matched = sapply(module_pvals, function(v) sum(!is.na(v))),
+    p_acat    = p_acat,
+    p_fisher  = p_fisher
+  )
+}
+
+module_results <- map_dfr(Nadig_associated_perturbation, compute_for_one_pert)
+
+# 查看结果
+# module_results %>%
+#   arrange(p_fisher) %>%
+#   print(n = 30)
+
+```
+
+
+```{r}
+library(tidyr)
+library(dplyr)
+library(tibble)
+
+snp_geneset_p_value<-  readRDS("/project/xuanyao/jiaming/paper/output/snake/Nadig_asthma/flames_200kb/K20/3000_t_ACAT_resample/p_values/geneset_p_value.rds")
+snp_geneset_p_value_test <- snp_geneset_p_value[which(!grepl("non-",rownames(snp_geneset_p_value))),]
+snp_geneset_p_value_control <- snp_geneset_p_value[which(grepl("non-",rownames(snp_geneset_p_value))),]
+
+df1_long <- snp_geneset_p_value_test %>%
+  as.data.frame() %>%
+  rownames_to_column("snp") %>%      # 这里真正把 rownames 变成一列 snp
+  pivot_longer(
+    -snp,
+    names_to  = "module",
+    values_to = "p_snp_geneset"
+  )
+
+## 2. 模块层面的表，只保留需要的列
+df2 <- module_results %>%
+  dplyr::select(module, p_fisher,snp)
+
+## 3. 按 module 合并，再调整列顺序
+merged <- df1_long %>%
+  left_join(df2, by = c("snp", "module")) %>%  # 关键改动
+  relocate(snp, module, p_snp_geneset, p_fisher)%>% tidyr::drop_na()
+
+
+# library(dplyr)
+# 
+# df1 <- as.data.frame(snp_geneset_p_value)
+# df1$snp <- rownames(df1)
+# 
+# df1_long <- df1 %>%
+#   pivot_longer(-snp, names_to = "module", values_to = "p_snp_geneset")
+# 
+# ## 图二：geneset_acat_pvals_M1.0001（列：module, p_acat）
+# df2 <- geneset_acat_pvals_M1.0001 %>%
+#   dplyr::select(module, p_fisher)
+# 
+# merged <- df1_long %>%
+#   left_join(df2, by = "module") %>%
+#   relocate(snp, module, p_snp_geneset, p_fisher)
+# 
+# 
+
+X <- merged[,c(3,4)]
+
+library(adaFilter)
+
+result <- adaFilter(X, r = 2,alpha=0.1)
+
+merged$decision <- result$decision
+colnames(merged)[c(3,4)] <- c("snp_geneset","geneset_trait")
+
+head(merged[merged$decision==1,])
+```
+
+
+
+```{r,fig.width=15,fig.height=15}
+
+dfl2 <- merged[merged$decision==1,]
+dfl2$gene_name <- dfl2$snp
+
+```
+
+
+```{r}
+result <- readRDS("/project/xuanyao/jiaming/Getting_started/data/GWAS/asthma/GCST010043/flames_200kb/result.rds")
+symbol_to_rsid <- result %>%         # 你的 1251×7 表
+  filter(!is.na(symbol)) %>%
+  dplyr::select(symbol, rsid) %>%
+  distinct()
+
+# ── 2. 把 rsid 加入 tbl_df ───────────────────────────────
+tbl_with_rsid <- dfl2 %>%
+  left_join(symbol_to_rsid, by = c("snp" = "symbol"))
+
+# ── 3. 按 rsid 分组合并 ──────────────────────────────────
+# 没有 rsid 匹配的行（rsid = NA）保持原样，snp 不变
+merged_df <- tbl_with_rsid %>%
+  group_by(rsid, module) %>%
+  mutate(
+    merged_snp = ifelse(
+      all(is.na(rsid)),
+      snp,
+      paste0(
+        paste(sort(unique(snp)), collapse = "-"),
+        " (", rsid[!is.na(rsid)][1], ")"
+      )
+    )
+  ) %>%
+  ungroup() %>%
+  group_by(merged_snp, module) %>%
+  summarise(
+    snp_geneset   = min(snp_geneset,   na.rm = TRUE),
+    geneset_trait = min(geneset_trait, na.rm = TRUE),
+    decision      = max(decision,      na.rm = TRUE),
+    gene_name     = paste(sort(unique(gene_name)), collapse = "-"),
+    .groups       = "drop"
+  ) 
+
+merged_df$gene_name <- merged_df$merged_snp
+```
+
+
+```{r}
+head(merged_df)
+```
+
+
+```{r}
+flames_symbols <- result %>%
+  filter(source == "FLAMES") %>%
+  pull(symbol) %>%
+  unique() %>%
+  na.omit()
+
+# 检查 merged_df 的 snp 列中是否包含这些 symbol
+# merged_snp 格式如 "RPS18-SLC39A7 (rs411919)"，需要拆解出 symbol 部分
+highlight_genes <- merged_df %>%
+  filter(
+    sapply(merged_snp, function(s) {
+      # 提取括号前的 symbol 部分，按 "-" 拆分
+      sym_part <- sub("\\s*\\(.*\\)$", "", s)       # 去掉 " (rsXXX)"
+      syms     <- strsplit(sym_part, "-")[[1]]       # 拆分多个 symbol
+      any(syms %in% flames_symbols)                  # 任一 symbol 在 FLAMES 中
+    })
+  )
+
+cat("FLAMES_gene 行数:", nrow(highlight_genes), "\n")
+print(highlight_genes)
+```
+
+
+
+
+```{r,fig.width=14,fig.height=14}
+
+plot_gene_module_network2(
+  merged_df,
+  top_n_gene = 200,
+  size_scale = 1,
+  highlight_genes = character(0),
+    highlight_mod = character(0),
+
+  layout_fun = igraph::layout_with_fr   # 关键：显式用 igraph 的
+)
+```
+
+# Asthma, FLAMES + 200 kb combined locus mapping
+
+In this section, GWAS loci are mapped using the union of FLAMES fine-mapping and a 200 kb genomic window. 3 values of K (10, 15 ,20 topics) are tested to assess robustness of the results to the number of latent topics. The downstream pipeline (GO enrichment → Fisher aggregation → AdaFilter → network visualization) is identical to the MCH analysis.
+
+## K = 10 topics
+
+### GO enrichment
+
+```{r}
+library(gprofiler2)
+ gene_modules_id <- readRDS("/project/xuanyao/jiaming/Getting_started/data/Nadig/topic_geneset/flames+200kb/de_10_0.01_2_0.5.rds")
+
+ de_10_0.01_2_0.5 <-gene_modules_id
+
+gene_sets <- lapply(de_10_0.01_2_0.5, function(x) unique(as.character(x)))
+
+# gene_sets <- lapply(de_10_0.01_2_0.5 , function(x) unique(as.character(x)))
+
+# 建议给每个 set 一个名字（没有就补上）
+if (is.null(names(gene_sets))) names(gene_sets) <- paste0("set_", seq_along(gene_sets))
+
+res <- gost(
+  query = gene_sets,                 # list of 100 gene vectors
+  organism = "hsapiens",
+  multi_query = TRUE,
+  correction_method = "fdr",
+  user_threshold = 0.05,
+  sources = c("GO:BP","GO:MF","KEGG")
+)
+
+
+
+# geneset 名字：如果你有 gene_sets 的 names 就用它；否则自动生成
+gs_names <- names(gene_sets)
+if (is.null(gs_names)) gs_names <- paste0("set_", seq_along(res$result$significant[[1]]))
+
+# GO term 名字：用 term_id 或 term_name（建议 term_id 更稳定）
+go_names <- paste0(res$result$source, ":", res$result$term_id)
+# 如果你更想用可读名字：
+# go_names <- paste0(res$result$source, ":", res$result$term_name)
+
+# 1) list -> 矩阵：每列一个 term，每行一个 geneset
+sig_term_by_set <- do.call(cbind, res$result$significant)
+storage.mode(sig_term_by_set) <- "logical"
+
+# 2) 转成“geneset(行) × term(列)”的 index matrix
+idx_mat <- sig_term_by_set  # 现在行=geneset, 列=term（通常就是这个方向）
+rownames(idx_mat) <- gs_names
+colnames(idx_mat) <- go_names
+
+
+# 如果你发现方向反了（极少数情况），就用这一句修正：
+# idx_mat <- t(idx_mat)
+
+library(dplyr)
+library(tidyr)
+
+go_tbl <- as_tibble(res$result)
+
+# geneset 名称（如果你有 names(gene_sets) 就用它；否则自动生成）
+G <- length(go_tbl$p_values[[1]])
+gs_names <- names(gene_sets)
+if (is.null(gs_names) || length(gs_names) != G) gs_names <- paste0("set_", seq_len(G))
+
+# 展开：term × geneset 的长表
+go_long <- go_tbl %>%
+  mutate(
+    query   = list(gs_names),
+    p_value = p_values,
+    sig     = significant       # significant 列也是 list，记录每个 geneset 是否显著
+  ) %>%
+  dplyr::select(source, term_id, term_name, query, p_value, sig) %>%
+  unnest(c(query, p_value, sig)) %>%
+  filter(sig == TRUE)  
+
+# 每个 geneset 取 top10（p_value 最小）
+top10_tbl <- go_long %>%
+  group_by(query) %>%
+  arrange(p_value, .by_group = TRUE) %>%
+  ungroup()
+
+# 你想要的：每个 geneset 的 top10 term_name（以及可选的 p_value）
+top10_names <- top10_tbl %>%
+  group_by(query) %>%
+  summarise(top10_term_name = list(term_name), .groups = "drop")
+
+
+
+# 注意！！！！！！！！！！！！！！！是按 1， 10 ，11 等排序
+```
+
+```{r}
+top10_names
+```
+
+### Geneset–trait associations and AdaFilter mediation test (Asthma, K10, flames+200kb)
+
+```{r}
+library(data.table)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(heavytailcombtest)
+
+# -----------------------------
+# 0) Read inputs
+# -----------------------------
+df <- fread("/project/xuanyao/jiaming/Getting_started/data/geneset_to_trait/asthma/asthma.tsv")
+df2 <- df[grepl("M1.01", df$Name), ]
+
+Nadig_associated_perturbation <- readRDS("/project/xuanyao/jiaming/Getting_started/data/GWAS/asthma/GCST010043/flames+200kb/Nadig_associated_perturbation_flames_200kb.rds")
+
+
+
+discovery_pairs_cis <- readRDS("/project/xuanyao/jiaming/Getting_started/data/Nadig/discovery_pairs_cis.rds")
+
+
+ gene_modules_id <- readRDS("/project/xuanyao/jiaming/Getting_started/data/Nadig/topic_geneset/flames+200kb/de_10_0.01_2_0.5.rds")
+
+all_measured_genes <- readRDS("/project/xuanyao/jiaming/Getting_started/data/Nadig/all_measured_genes.rds")
+
+# 只保留测到的 genes
+gene_modules_id <- lapply(gene_modules_id, function(vec) intersect(vec, all_measured_genes))
+
+
+# -----------------------------
+# 1) Build pv_map from df2
+# -----------------------------
+gene_id <- str_extract(df2$Name, "(?<=\\()[^()]+(?=\\))")
+
+lookup <- df2 %>%
+  mutate(ID = gene_id) %>%
+  filter(!is.na(ID), !is.na(p_value)) %>%
+  group_by(ID) %>%
+  summarise(p_value = min(p_value), .groups = "drop")
+
+pv_map <- setNames(lookup$p_value, lookup$ID)
+
+
+# -----------------------------
+# 2) Helpers
+# -----------------------------
+clean_p <- function(p) {
+  p <- as.numeric(p)
+  p[is.na(p) | p <= 0] <- NA
+  p
+}
+
+safe_comb <- function(p) {
+  p <- as.numeric(p)
+  p <- p[!is.na(p) & p > 0 & p <= 1]
+  if (length(p) == 0) return(NA_real_)
+  if (length(p) == 1) return(p)
+
+  combination.test(
+    p,
+    weights = NA,
+    method = "Cauchy",
+    tail.idx = 1
+  )
+}
+
+safe_comb_fisher <- function(p) {
+  p <- as.numeric(p)
+  p <- p[!is.na(p) & p > 0 & p <= 1]
+  if (length(p) == 0) return(NA_real_)
+  if (length(p) == 1) return(p)
+
+  stat <- -2 * sum(log(p))
+  stats::pchisq(stat, df = 2 * length(p), lower.tail = FALSE)
+}
+
+
+# -----------------------------
+# 3) Make filtered modules per perturbation (and record n_removed)
+# -----------------------------
+make_filtered_modules <- function(gene_symbol, gene_modules_id, pairs_df) {
+  target_name <- paste0("tar-",gene_symbol)
+
+  ids_to_remove <- unique(pairs_df$response_id[pairs_df$grna_target == target_name])
+
+  filtered_modules <- lapply(gene_modules_id, function(mod_ids) {
+    setdiff(mod_ids, ids_to_remove)
+  })
+
+  list(
+    modules   = filtered_modules,
+    n_removed = length(ids_to_remove)
+  )
+}
+
+filtered_by_perturbation <- setNames(
+  lapply(
+    Nadig_associated_perturbation,
+    make_filtered_modules,
+    gene_modules_id = gene_modules_id,
+    pairs_df = discovery_pairs_cis
+  ),
+  Nadig_associated_perturbation
+)
+
+
+# -----------------------------
+# 4) Compute module-level combined p-values per perturbation
+#    (and add n_removed into module_results)
+# -----------------------------
+compute_for_one_pert <- function(pert) {
+  obj <- filtered_by_perturbation[[pert]]
+  gene_modules_id_pert <- obj$modules
+  n_removed <- obj$n_removed
+
+  # module -> p-values vector under this perturbation
+  module_pvals <- lapply(gene_modules_id_pert, function(genes) {
+    p <- pv_map[genes]
+    names(p) <- genes
+    p[!is.na(p)]
+  })
+
+  # combine within each module
+  p_acat <- map_dbl(module_pvals, ~ {
+    p <- clean_p(.x)
+    if (!length(p)) return(NA_real_)
+    as.numeric(safe_comb(p))
+  })
+
+  p_fisher <- map_dbl(module_pvals, ~ {
+    p <- clean_p(.x)
+    if (!length(p)) return(NA_real_)
+    as.numeric(safe_comb_fisher(p))
+  })
+
+  tibble(
+    snp       = pert,
+    n_removed = n_removed,  # ✅ 每个 perturbation 的 ids_to_remove 数量（复制到每一行 module）
+    module    = names(module_pvals),
+    n_genes   = lengths(gene_modules_id_pert),
+    n_matched = sapply(module_pvals, function(v) sum(!is.na(v))),
+    p_acat    = p_acat,
+    p_fisher  = p_fisher
+  )
+}
+
+module_results <- map_dfr(Nadig_associated_perturbation, compute_for_one_pert)
+
+# 查看结果
+# module_results %>%
+#   arrange(p_fisher) %>%
+#   print(n = 30)
+
+```
+
+
+```{r}
+library(tidyr)
+library(dplyr)
+library(tibble)
+
+snp_geneset_p_value<-  readRDS("/project/xuanyao/jiaming/paper/output/snake/Nadig_asthma/flames+200kb/K10/3000_t_ACAT_resample/p_values/geneset_p_value.rds")
+snp_geneset_p_value_test <- snp_geneset_p_value[which(!grepl("non-",rownames(snp_geneset_p_value))),]
+snp_geneset_p_value_control <- snp_geneset_p_value[which(grepl("non-",rownames(snp_geneset_p_value))),]
+
+df1_long <- snp_geneset_p_value_test %>%
+  as.data.frame() %>%
+  rownames_to_column("snp") %>%      # 这里真正把 rownames 变成一列 snp
+  pivot_longer(
+    -snp,
+    names_to  = "module",
+    values_to = "p_snp_geneset"
+  )
+
+## 2. 模块层面的表，只保留需要的列
+df2 <- module_results %>%
+  dplyr::select(module, p_fisher,snp)
+
+## 3. 按 module 合并，再调整列顺序
+merged <- df1_long %>%
+  left_join(df2, by = c("snp", "module")) %>%  # 关键改动
+  relocate(snp, module, p_snp_geneset, p_fisher)%>% tidyr::drop_na()
+
+
+# library(dplyr)
+# 
+# df1 <- as.data.frame(snp_geneset_p_value)
+# df1$snp <- rownames(df1)
+# 
+# df1_long <- df1 %>%
+#   pivot_longer(-snp, names_to = "module", values_to = "p_snp_geneset")
+# 
+# ## 图二：geneset_acat_pvals_M1.0001（列：module, p_acat）
+# df2 <- geneset_acat_pvals_M1.0001 %>%
+#   dplyr::select(module, p_fisher)
+# 
+# merged <- df1_long %>%
+#   left_join(df2, by = "module") %>%
+#   relocate(snp, module, p_snp_geneset, p_fisher)
+# 
+# 
+
+X <- merged[,c(3,4)]
+
+library(adaFilter)
+
+result <- adaFilter(X, r = 2,alpha=0.1)
+
+merged$decision <- result$decision
+colnames(merged)[c(3,4)] <- c("snp_geneset","geneset_trait")
+
+head(merged[merged$decision==1,])
+```
+
+
+
+```{r,fig.width=15,fig.height=15}
+
+dfl2 <- merged[merged$decision==1,]
+dfl2$gene_name <- dfl2$snp
+# plot_gene_module_network2(
+#   dfl2,
+#   top_n_gene = 300,
+#   size_scale = 1,
+#   highlight_genes = character(0),
+#     highlight_mod = character(0),
+#   gene_modules_id = gene_modules_id,   # <- 传入
+# 
+#   layout_fun = igraph::layout_with_fr   # 关键：显式用 igraph 的
+# )
+
+
+```
+
+
+```{r}
+result <- readRDS("/project/xuanyao/jiaming/Getting_started/data/GWAS/asthma/GCST010043/flames+200kb/result.rds")
+symbol_to_rsid <- result %>%         # 你的 1251×7 表
+  filter(!is.na(symbol)) %>%
+  dplyr::select(symbol, rsid) %>%
+  distinct()
+
+# ── 2. 把 rsid 加入 tbl_df ───────────────────────────────
+tbl_with_rsid <- dfl2 %>%
+  left_join(symbol_to_rsid, by = c("snp" = "symbol"))
+
+# ── 3. 按 rsid 分组合并 ──────────────────────────────────
+# 没有 rsid 匹配的行（rsid = NA）保持原样，snp 不变
+merged_df <- tbl_with_rsid %>%
+  group_by(rsid, module) %>%
+  mutate(
+    merged_snp = ifelse(
+      all(is.na(rsid)),
+      snp,
+      paste0(
+        paste(sort(unique(snp)), collapse = "-"),
+        " (", rsid[!is.na(rsid)][1], ")"
+      )
+    )
+  ) %>%
+  ungroup() %>%
+  group_by(merged_snp, module) %>%
+  summarise(
+    snp_geneset   = min(snp_geneset,   na.rm = TRUE),
+    geneset_trait = min(geneset_trait, na.rm = TRUE),
+    decision      = max(decision,      na.rm = TRUE),
+    gene_name     = paste(sort(unique(gene_name)), collapse = "-"),
+    .groups       = "drop"
+  ) 
+
+merged_df$gene_name <- merged_df$merged_snp
+```
+
+
+
+
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+
+# 1. 从result提取rsid的位置信息
+result_pos <- result %>%
+  dplyr::select(rsid, locations) %>%
+  separate(locations, into = c("chr", "pos"), sep = ":", convert = TRUE) %>%
+  distinct(rsid, .keep_all = TRUE)
+
+# 2. 从merged_snp提取rsid（括号内的rs号）
+merged_df <- merged_df %>%
+  mutate(snp_rsid = str_extract(merged_snp, "rs\\d+"))
+
+# 3. 给merged_df加上位置信息
+merged_with_pos <- merged_df %>%
+  left_join(result_pos, by = c("snp_rsid" = "rsid"))
+
+# 4. 计算每对merged_snp与result中所有rsid的距离，找最小值
+# 先获取result所有位置
+result_all_pos <- result_pos %>%
+  rename(ref_chr = chr, ref_pos = pos)
+
+distance_result <- merged_with_pos %>%
+  rowwise() %>%
+  mutate(
+    min_distance = {
+      current_chr <- chr
+      current_pos <- pos
+      current_rsid <- snp_rsid
+      
+      others <- merged_with_pos %>% 
+        filter(chr == current_chr,
+               snp_rsid != current_rsid)
+      
+      if (nrow(others) == 0) NA_real_
+      else min(abs(others$pos - current_pos))
+    },
+    closest_snp = {
+      current_chr <- chr
+      current_pos <- pos
+      current_rsid <- snp_rsid
+      
+      others <- merged_with_pos %>% 
+        filter(chr == current_chr,
+               snp_rsid != current_rsid)
+      
+      if (nrow(others) == 0) NA_character_
+      else others$merged_snp[which.min(abs(others$pos - current_pos))]
+    }
+  ) %>%
+  ungroup()
+
+distance_result %>%
+  dplyr::select(merged_snp, chr, pos, closest_snp, min_distance) %>%
+  arrange(min_distance)
+```
+
+
+
+```{r}
+flames_symbols <- result %>%
+  filter(source == "FLAMES") %>%
+  pull(symbol) %>%
+  unique() %>%
+  na.omit()
+
+# 检查 merged_df 的 snp 列中是否包含这些 symbol
+# merged_snp 格式如 "RPS18-SLC39A7 (rs411919)"，需要拆解出 symbol 部分
+highlight_genes <- merged_df %>%
+  filter(
+    sapply(merged_snp, function(s) {
+      # 提取括号前的 symbol 部分，按 "-" 拆分
+      sym_part <- sub("\\s*\\(.*\\)$", "", s)       # 去掉 " (rsXXX)"
+      syms     <- strsplit(sym_part, "-")[[1]]       # 拆分多个 symbol
+      any(syms %in% flames_symbols)                  # 任一 symbol 在 FLAMES 中
+    })
+  )
+
+cat("FLAMES_genes 行数:", nrow(highlight_genes), "\n")
+print(highlight_genes)
+```
+
+
+### dandelion plot
+
+
+```{r,fig.width=14,fig.height=14}
+
+plot_gene_module_network2(
+  merged_df,
+  top_n_gene = 200,
+  size_scale = 1,
+  highlight_genes = character(0),
+    highlight_mod = character(0),
+    gene_modules_id = gene_modules_id,   # <- 传入
+
+
+  layout_fun = igraph::layout_with_fr   # 关键：显式用 igraph 的
+)
+```
+
+
+
+## K = 15 topics
+
+```{r}
+library(gprofiler2)
+ gene_modules_id <- readRDS("/project/xuanyao/jiaming/Getting_started/data/Nadig/topic_geneset/flames+200kb/de_15_0.01_2_0.5.rds")
+
+ de_10_0.01_2_0.5 <-gene_modules_id
+
+gene_sets <- lapply(de_10_0.01_2_0.5, function(x) unique(as.character(x)))
+
+# gene_sets <- lapply(de_10_0.01_2_0.5 , function(x) unique(as.character(x)))
+
+# 建议给每个 set 一个名字（没有就补上）
+if (is.null(names(gene_sets))) names(gene_sets) <- paste0("set_", seq_along(gene_sets))
+
+res <- gost(
+  query = gene_sets,                 # list of 100 gene vectors
+  organism = "hsapiens",
+  multi_query = TRUE,
+  correction_method = "fdr",
+  user_threshold = 0.05,
+  sources = c("GO:BP","GO:MF","KEGG")
+)
+
+
+
+# geneset 名字：如果你有 gene_sets 的 names 就用它；否则自动生成
+gs_names <- names(gene_sets)
+if (is.null(gs_names)) gs_names <- paste0("set_", seq_along(res$result$significant[[1]]))
+
+# GO term 名字：用 term_id 或 term_name（建议 term_id 更稳定）
+go_names <- paste0(res$result$source, ":", res$result$term_id)
+# 如果你更想用可读名字：
+# go_names <- paste0(res$result$source, ":", res$result$term_name)
+
+# 1) list -> 矩阵：每列一个 term，每行一个 geneset
+sig_term_by_set <- do.call(cbind, res$result$significant)
+storage.mode(sig_term_by_set) <- "logical"
+
+# 2) 转成“geneset(行) × term(列)”的 index matrix
+idx_mat <- sig_term_by_set  # 现在行=geneset, 列=term（通常就是这个方向）
+rownames(idx_mat) <- gs_names
+colnames(idx_mat) <- go_names
+
+
+# 如果你发现方向反了（极少数情况），就用这一句修正：
+# idx_mat <- t(idx_mat)
+
+library(dplyr)
+library(tidyr)
+
+go_tbl <- as_tibble(res$result)
+
+# geneset 名称（如果你有 names(gene_sets) 就用它；否则自动生成）
+G <- length(go_tbl$p_values[[1]])
+gs_names <- names(gene_sets)
+if (is.null(gs_names) || length(gs_names) != G) gs_names <- paste0("set_", seq_len(G))
+
+# 展开：term × geneset 的长表
+go_long <- go_tbl %>%
+  mutate(
+    query   = list(gs_names),
+    p_value = p_values,
+    sig     = significant       # significant 列也是 list，记录每个 geneset 是否显著
+  ) %>%
+  dplyr::select(source, term_id, term_name, query, p_value, sig) %>%
+  unnest(c(query, p_value, sig)) %>%
+  filter(sig == TRUE)  
+
+# 每个 geneset 取 top10（p_value 最小）
+top10_tbl <- go_long %>%
+  group_by(query) %>%
+  arrange(p_value, .by_group = TRUE) %>%
+  ungroup()
+
+# 你想要的：每个 geneset 的 top10 term_name（以及可选的 p_value）
+top10_names <- top10_tbl %>%
+  group_by(query) %>%
+  summarise(top10_term_name = list(term_name), .groups = "drop")
+
+
+
+# 注意！！！！！！！！！！！！！！！是按 1， 10 ，11 等排序
+```
+
+
+
+### Geneset–trait associations and AdaFilter mediation test (Asthma, K15, flames+200kb)
+
+
+
+
+```{r}
+library(data.table)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(heavytailcombtest)
+
+# -----------------------------
+# 0) Read inputs
+# -----------------------------
+df <- fread("/project/xuanyao/jiaming/Getting_started/data/geneset_to_trait/asthma/asthma.tsv")
+df2 <- df[grepl("M1.01", df$Name), ]
+
+Nadig_associated_perturbation <- readRDS("/project/xuanyao/jiaming/Getting_started/data/GWAS/asthma/GCST010043/flames+200kb/Nadig_associated_perturbation_flames_200kb.rds")
+
+
+
+discovery_pairs_cis <- readRDS("/project/xuanyao/jiaming/Getting_started/data/Nadig/discovery_pairs_cis.rds")
+
+
+ gene_modules_id <- readRDS("/project/xuanyao/jiaming/Getting_started/data/Nadig/topic_geneset/flames+200kb/de_15_0.01_2_0.5.rds")
+
+all_measured_genes <- readRDS("/project/xuanyao/jiaming/Getting_started/data/Nadig/all_measured_genes.rds")
+
+# 只保留测到的 genes
+gene_modules_id <- lapply(gene_modules_id, function(vec) intersect(vec, all_measured_genes))
+
+
+# -----------------------------
+# 1) Build pv_map from df2
+# -----------------------------
+gene_id <- str_extract(df2$Name, "(?<=\\()[^()]+(?=\\))")
+
+lookup <- df2 %>%
+  mutate(ID = gene_id) %>%
+  filter(!is.na(ID), !is.na(p_value)) %>%
+  group_by(ID) %>%
+  summarise(p_value = min(p_value), .groups = "drop")
+
+pv_map <- setNames(lookup$p_value, lookup$ID)
+
+
+# -----------------------------
+# 2) Helpers
+# -----------------------------
+clean_p <- function(p) {
+  p <- as.numeric(p)
+  p[is.na(p) | p <= 0] <- NA
+  p
+}
+
+safe_comb <- function(p) {
+  p <- as.numeric(p)
+  p <- p[!is.na(p) & p > 0 & p <= 1]
+  if (length(p) == 0) return(NA_real_)
+  if (length(p) == 1) return(p)
+
+  combination.test(
+    p,
+    weights = NA,
+    method = "Cauchy",
+    tail.idx = 1
+  )
+}
+
+safe_comb_fisher <- function(p) {
+  p <- as.numeric(p)
+  p <- p[!is.na(p) & p > 0 & p <= 1]
+  if (length(p) == 0) return(NA_real_)
+  if (length(p) == 1) return(p)
+
+  stat <- -2 * sum(log(p))
+  stats::pchisq(stat, df = 2 * length(p), lower.tail = FALSE)
+}
+
+
+# -----------------------------
+# 3) Make filtered modules per perturbation (and record n_removed)
+# -----------------------------
+make_filtered_modules <- function(gene_symbol, gene_modules_id, pairs_df) {
+  target_name <- paste0("tar-",gene_symbol)
+
+  ids_to_remove <- unique(pairs_df$response_id[pairs_df$grna_target == target_name])
+
+  filtered_modules <- lapply(gene_modules_id, function(mod_ids) {
+    setdiff(mod_ids, ids_to_remove)
+  })
+
+  list(
+    modules   = filtered_modules,
+    n_removed = length(ids_to_remove)
+  )
+}
+
+filtered_by_perturbation <- setNames(
+  lapply(
+    Nadig_associated_perturbation,
+    make_filtered_modules,
+    gene_modules_id = gene_modules_id,
+    pairs_df = discovery_pairs_cis
+  ),
+  Nadig_associated_perturbation
+)
+
+
+# -----------------------------
+# 4) Compute module-level combined p-values per perturbation
+#    (and add n_removed into module_results)
+# -----------------------------
+compute_for_one_pert <- function(pert) {
+  obj <- filtered_by_perturbation[[pert]]
+  gene_modules_id_pert <- obj$modules
+  n_removed <- obj$n_removed
+
+  # module -> p-values vector under this perturbation
+  module_pvals <- lapply(gene_modules_id_pert, function(genes) {
+    p <- pv_map[genes]
+    names(p) <- genes
+    p[!is.na(p)]
+  })
+
+  # combine within each module
+  p_acat <- map_dbl(module_pvals, ~ {
+    p <- clean_p(.x)
+    if (!length(p)) return(NA_real_)
+    as.numeric(safe_comb(p))
+  })
+
+  p_fisher <- map_dbl(module_pvals, ~ {
+    p <- clean_p(.x)
+    if (!length(p)) return(NA_real_)
+    as.numeric(safe_comb_fisher(p))
+  })
+
+  tibble(
+    snp       = pert,
+    n_removed = n_removed,  # ✅ 每个 perturbation 的 ids_to_remove 数量（复制到每一行 module）
+    module    = names(module_pvals),
+    n_genes   = lengths(gene_modules_id_pert),
+    n_matched = sapply(module_pvals, function(v) sum(!is.na(v))),
+    p_acat    = p_acat,
+    p_fisher  = p_fisher
+  )
+}
+
+module_results <- map_dfr(Nadig_associated_perturbation, compute_for_one_pert)
+
+# 查看结果
+module_results %>%
+  arrange(p_fisher) %>%
+  print(n = 30)
+
+```
+
+
+```{r}
+library(tidyr)
+library(dplyr)
+library(tibble)
+
+snp_geneset_p_value<-  readRDS("/project/xuanyao/jiaming/paper/output/snake/Nadig_asthma/flames+200kb/K15/3000_t_ACAT_resample/p_values/geneset_p_value.rds")
+snp_geneset_p_value_test <- snp_geneset_p_value[which(!grepl("non-",rownames(snp_geneset_p_value))),]
+snp_geneset_p_value_control <- snp_geneset_p_value[which(grepl("non-",rownames(snp_geneset_p_value))),]
+
+df1_long <- snp_geneset_p_value_test %>%
+  as.data.frame() %>%
+  rownames_to_column("snp") %>%      # 这里真正把 rownames 变成一列 snp
+  pivot_longer(
+    -snp,
+    names_to  = "module",
+    values_to = "p_snp_geneset"
+  )
+
+## 2. 模块层面的表，只保留需要的列
+df2 <- module_results %>%
+  dplyr::select(module, p_fisher,snp)
+
+## 3. 按 module 合并，再调整列顺序
+merged <- df1_long %>%
+  left_join(df2, by = c("snp", "module")) %>%  # 关键改动
+  relocate(snp, module, p_snp_geneset, p_fisher)%>% tidyr::drop_na()
+
+
+# library(dplyr)
+# 
+# df1 <- as.data.frame(snp_geneset_p_value)
+# df1$snp <- rownames(df1)
+# 
+# df1_long <- df1 %>%
+#   pivot_longer(-snp, names_to = "module", values_to = "p_snp_geneset")
+# 
+# ## 图二：geneset_acat_pvals_M1.0001（列：module, p_acat）
+# df2 <- geneset_acat_pvals_M1.0001 %>%
+#   dplyr::select(module, p_fisher)
+# 
+# merged <- df1_long %>%
+#   left_join(df2, by = "module") %>%
+#   relocate(snp, module, p_snp_geneset, p_fisher)
+# 
+# 
+
+X <- merged[,c(3,4)]
+
+library(adaFilter)
+
+result <- adaFilter(X, r = 2,alpha=0.1)
+
+merged$decision <- result$decision
+colnames(merged)[c(3,4)] <- c("snp_geneset","geneset_trait")
+
+merged[merged$decision==1,]
+```
+
+
+
+```{r,fig.width=15,fig.height=15}
+
+dfl2 <- merged[merged$decision==1,]
+dfl2$gene_name <- dfl2$snp
+plot_gene_module_network2(
+  dfl2,
+  top_n_gene = 200,
+  size_scale = 1,
+  highlight_genes = character(0),
+    highlight_mod = character(0),
+  gene_modules_id = gene_modules_id,   # <- 传入
+
+  layout_fun = igraph::layout_with_fr   # 关键：显式用 igraph 的
+)
+```
+```{r}
+result <- readRDS("/project/xuanyao/jiaming/Getting_started/data/GWAS/asthma/GCST010043/flames+200kb/result.rds")
+symbol_to_rsid <- result %>%         # 你的 1251×7 表
+  filter(!is.na(symbol)) %>%
+  dplyr::select(symbol, rsid) %>%
+  distinct()
+
+# ── 2. 把 rsid 加入 tbl_df ───────────────────────────────
+tbl_with_rsid <- dfl2 %>%
+  left_join(symbol_to_rsid, by = c("snp" = "symbol"))
+
+# ── 3. 按 rsid 分组合并 ──────────────────────────────────
+# 没有 rsid 匹配的行（rsid = NA）保持原样，snp 不变
+merged_df <- tbl_with_rsid %>%
+  group_by(rsid, module) %>%
+  mutate(
+    merged_snp = ifelse(
+      all(is.na(rsid)),
+      snp,
+      paste0(
+        paste(sort(unique(snp)), collapse = "-"),
+        " (", rsid[!is.na(rsid)][1], ")"
+      )
+    )
+  ) %>%
+  ungroup() %>%
+  group_by(merged_snp, module) %>%
+  summarise(
+    snp_geneset   = min(snp_geneset,   na.rm = TRUE),
+    geneset_trait = min(geneset_trait, na.rm = TRUE),
+    decision      = max(decision,      na.rm = TRUE),
+    gene_name     = paste(sort(unique(gene_name)), collapse = "-"),
+    .groups       = "drop"
+  ) 
+
+merged_df$gene_name <- merged_df$merged_snp
+```
+
+
+```{r}
+merged_df
+```
+```{r}
+library(dplyr)
+library(tidyr)
+
+# 1. 从result提取rsid的位置信息
+result_pos <- result %>%
+  dplyr::select(rsid, locations) %>%
+  separate(locations, into = c("chr", "pos"), sep = ":", convert = TRUE) %>%
+  distinct(rsid, .keep_all = TRUE)
+
+# 2. 从merged_snp提取rsid（括号内的rs号）
+merged_df <- merged_df %>%
+  mutate(snp_rsid = str_extract(merged_snp, "rs\\d+"))
+
+# 3. 给merged_df加上位置信息
+merged_with_pos <- merged_df %>%
+  left_join(result_pos, by = c("snp_rsid" = "rsid"))
+
+# 4. 计算每对merged_snp与result中所有rsid的距离，找最小值
+# 先获取result所有位置
+result_all_pos <- result_pos %>%
+  rename(ref_chr = chr, ref_pos = pos)
+
+distance_result <- merged_with_pos %>%
+  rowwise() %>%
+  mutate(
+    min_distance = {
+      current_chr <- chr
+      current_pos <- pos
+      current_rsid <- snp_rsid
+      
+      others <- merged_with_pos %>% 
+        filter(chr == current_chr,
+               snp_rsid != current_rsid)
+      
+      if (nrow(others) == 0) NA_real_
+      else min(abs(others$pos - current_pos))
+    },
+    closest_snp = {
+      current_chr <- chr
+      current_pos <- pos
+      current_rsid <- snp_rsid
+      
+      others <- merged_with_pos %>% 
+        filter(chr == current_chr,
+               snp_rsid != current_rsid)
+      
+      if (nrow(others) == 0) NA_character_
+      else others$merged_snp[which.min(abs(others$pos - current_pos))]
+    }
+  ) %>%
+  ungroup()
+
+distance_result %>%
+  dplyr::select(merged_snp, chr, pos, closest_snp, min_distance) %>%
+  arrange(min_distance)
+```
+
+
+```{r}
+flames_symbols <- result %>%
+  filter(source == "FLAMES") %>%
+  pull(symbol) %>%
+  unique() %>%
+  na.omit()
+
+# 检查 merged_df 的 snp 列中是否包含这些 symbol
+# merged_snp 格式如 "RPS18-SLC39A7 (rs411919)"，需要拆解出 symbol 部分
+highlight_genes <- merged_df %>%
+  filter(
+    sapply(merged_snp, function(s) {
+      # 提取括号前的 symbol 部分，按 "-" 拆分
+      sym_part <- sub("\\s*\\(.*\\)$", "", s)       # 去掉 " (rsXXX)"
+      syms     <- strsplit(sym_part, "-")[[1]]       # 拆分多个 symbol
+      any(syms %in% flames_symbols)                  # 任一 symbol 在 FLAMES 中
+    })
+  )
+
+cat("FLAMES_genes 行数:", nrow(highlight_genes), "\n")
+print(highlight_genes)
+```
+
+### dandelion plot
+
+
+
+```{r,fig.width=14,fig.height=14}
+
+plot_gene_module_network2(
+  merged_df,
+  top_n_gene = 200,
+  size_scale = 1,
+  highlight_genes = character(0),
+    highlight_mod = character(0),
+  gene_modules_id = gene_modules_id,   # <- 传入
+
+  layout_fun = igraph::layout_with_fr   # 关键：显式用 igraph 的
+)
+```
+
+
+## K=20
+
+### GO enrichment
+
+```{r}
+library(gprofiler2)
+ gene_modules_id <- readRDS("/project/xuanyao/jiaming/Getting_started/data/Nadig/topic_geneset/flames+200kb/de_20_0.01_2_0.5.rds")
+
+ de_10_0.01_2_0.5 <-gene_modules_id
+
+gene_sets <- lapply(de_10_0.01_2_0.5, function(x) unique(as.character(x)))
+
+# gene_sets <- lapply(de_10_0.01_2_0.5 , function(x) unique(as.character(x)))
+
+# 建议给每个 set 一个名字（没有就补上）
+if (is.null(names(gene_sets))) names(gene_sets) <- paste0("set_", seq_along(gene_sets))
+
+res <- gost(
+  query = gene_sets,                 # list of 100 gene vectors
+  organism = "hsapiens",
+  multi_query = TRUE,
+  correction_method = "fdr",
+  user_threshold = 0.05,
+  sources = c("GO:BP","GO:MF","KEGG")
+)
+
+
+
+# geneset 名字：如果你有 gene_sets 的 names 就用它；否则自动生成
+gs_names <- names(gene_sets)
+if (is.null(gs_names)) gs_names <- paste0("set_", seq_along(res$result$significant[[1]]))
+
+# GO term 名字：用 term_id 或 term_name（建议 term_id 更稳定）
+go_names <- paste0(res$result$source, ":", res$result$term_id)
+# 如果你更想用可读名字：
+# go_names <- paste0(res$result$source, ":", res$result$term_name)
+
+# 1) list -> 矩阵：每列一个 term，每行一个 geneset
+sig_term_by_set <- do.call(cbind, res$result$significant)
+storage.mode(sig_term_by_set) <- "logical"
+
+# 2) 转成“geneset(行) × term(列)”的 index matrix
+idx_mat <- sig_term_by_set  # 现在行=geneset, 列=term（通常就是这个方向）
+rownames(idx_mat) <- gs_names
+colnames(idx_mat) <- go_names
+
+
+# 如果你发现方向反了（极少数情况），就用这一句修正：
+# idx_mat <- t(idx_mat)
+
+library(dplyr)
+library(tidyr)
+
+go_tbl <- as_tibble(res$result)
+
+# geneset 名称（如果你有 names(gene_sets) 就用它；否则自动生成）
+G <- length(go_tbl$p_values[[1]])
+gs_names <- names(gene_sets)
+if (is.null(gs_names) || length(gs_names) != G) gs_names <- paste0("set_", seq_len(G))
+
+# 展开：term × geneset 的长表
+go_long <- go_tbl %>%
+  mutate(
+    query   = list(gs_names),
+    p_value = p_values,
+    sig     = significant       # significant 列也是 list，记录每个 geneset 是否显著
+  ) %>%
+  dplyr::select(source, term_id, term_name, query, p_value, sig) %>%
+  unnest(c(query, p_value, sig)) %>%
+  filter(sig == TRUE)  
+
+# 每个 geneset 取 top10（p_value 最小）
+top10_tbl <- go_long %>%
+  group_by(query) %>%
+  arrange(p_value, .by_group = TRUE) %>%
+  ungroup()
+
+# 你想要的：每个 geneset 的 top10 term_name（以及可选的 p_value）
+top10_names <- top10_tbl %>%
+  group_by(query) %>%
+  summarise(top10_term_name = list(term_name), .groups = "drop")
+
+
+
+# 注意！！！！！！！！！！！！！！！是按 1， 10 ，11 等排序
+```
+
+```{r}
+top10_names
+```
+
+
+
+### Geneset–trait associations and AdaFilter mediation test (Asthma, K20, flames+200kb)
+
+
+```{r}
+library(data.table)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(heavytailcombtest)
+
+# -----------------------------
+# 0) Read inputs
+# -----------------------------
+df <- fread("/project/xuanyao/jiaming/Getting_started/data/geneset_to_trait/asthma/asthma.tsv")
+df2 <- df[grepl("M1.01", df$Name), ]
+
+Nadig_associated_perturbation <- readRDS("/project/xuanyao/jiaming/Getting_started/data/GWAS/asthma/GCST010043/flames+200kb/Nadig_associated_perturbation_flames_200kb.rds")
+
+
+
+discovery_pairs_cis <- readRDS("/project/xuanyao/jiaming/Getting_started/data/Nadig/discovery_pairs_cis.rds")
+
+
+ gene_modules_id <- readRDS("/project/xuanyao/jiaming/Getting_started/data/Nadig/topic_geneset/flames+200kb/de_20_0.01_2_0.5.rds")
+
+all_measured_genes <- readRDS("/project/xuanyao/jiaming/Getting_started/data/Nadig/all_measured_genes.rds")
+
+# 只保留测到的 genes
+gene_modules_id <- lapply(gene_modules_id, function(vec) intersect(vec, all_measured_genes))
+
+
+# -----------------------------
+# 1) Build pv_map from df2
+# -----------------------------
+gene_id <- str_extract(df2$Name, "(?<=\\()[^()]+(?=\\))")
+
+lookup <- df2 %>%
+  mutate(ID = gene_id) %>%
+  filter(!is.na(ID), !is.na(p_value)) %>%
+  group_by(ID) %>%
+  summarise(p_value = min(p_value), .groups = "drop")
+
+pv_map <- setNames(lookup$p_value, lookup$ID)
+
+
+# -----------------------------
+# 2) Helpers
+# -----------------------------
+clean_p <- function(p) {
+  p <- as.numeric(p)
+  p[is.na(p) | p <= 0] <- NA
+  p
+}
+
+safe_comb <- function(p) {
+  p <- as.numeric(p)
+  p <- p[!is.na(p) & p > 0 & p <= 1]
+  if (length(p) == 0) return(NA_real_)
+  if (length(p) == 1) return(p)
+
+  combination.test(
+    p,
+    weights = NA,
+    method = "Cauchy",
+    tail.idx = 1
+  )
+}
+
+safe_comb_fisher <- function(p) {
+  p <- as.numeric(p)
+  p <- p[!is.na(p) & p > 0 & p <= 1]
+  if (length(p) == 0) return(NA_real_)
+  if (length(p) == 1) return(p)
+
+  stat <- -2 * sum(log(p))
+  stats::pchisq(stat, df = 2 * length(p), lower.tail = FALSE)
+}
+
+
+# -----------------------------
+# 3) Make filtered modules per perturbation (and record n_removed)
+# -----------------------------
+make_filtered_modules <- function(gene_symbol, gene_modules_id, pairs_df) {
+  target_name <- paste0("tar-",gene_symbol)
+
+  ids_to_remove <- unique(pairs_df$response_id[pairs_df$grna_target == target_name])
+
+  filtered_modules <- lapply(gene_modules_id, function(mod_ids) {
+    setdiff(mod_ids, ids_to_remove)
+  })
+
+  list(
+    modules   = filtered_modules,
+    n_removed = length(ids_to_remove)
+  )
+}
+
+filtered_by_perturbation <- setNames(
+  lapply(
+    Nadig_associated_perturbation,
+    make_filtered_modules,
+    gene_modules_id = gene_modules_id,
+    pairs_df = discovery_pairs_cis
+  ),
+  Nadig_associated_perturbation
+)
+
+
+# -----------------------------
+# 4) Compute module-level combined p-values per perturbation
+#    (and add n_removed into module_results)
+# -----------------------------
+compute_for_one_pert <- function(pert) {
+  obj <- filtered_by_perturbation[[pert]]
+  gene_modules_id_pert <- obj$modules
+  n_removed <- obj$n_removed
+
+  # module -> p-values vector under this perturbation
+  module_pvals <- lapply(gene_modules_id_pert, function(genes) {
+    p <- pv_map[genes]
+    names(p) <- genes
+    p[!is.na(p)]
+  })
+
+  # combine within each module
+  p_acat <- map_dbl(module_pvals, ~ {
+    p <- clean_p(.x)
+    if (!length(p)) return(NA_real_)
+    as.numeric(safe_comb(p))
+  })
+
+  p_fisher <- map_dbl(module_pvals, ~ {
+    p <- clean_p(.x)
+    if (!length(p)) return(NA_real_)
+    as.numeric(safe_comb_fisher(p))
+  })
+
+  tibble(
+    snp       = pert,
+    n_removed = n_removed,  # ✅ 每个 perturbation 的 ids_to_remove 数量（复制到每一行 module）
+    module    = names(module_pvals),
+    n_genes   = lengths(gene_modules_id_pert),
+    n_matched = sapply(module_pvals, function(v) sum(!is.na(v))),
+    p_acat    = p_acat,
+    p_fisher  = p_fisher
+  )
+}
+
+module_results <- map_dfr(Nadig_associated_perturbation, compute_for_one_pert)
+
+# 查看结果
+# module_results %>%
+#   arrange(p_fisher) %>%
+#   print(n = 30)
+
+```
+
+
+```{r}
+library(tidyr)
+library(dplyr)
+library(tibble)
+
+snp_geneset_p_value<-  readRDS("/project/xuanyao/jiaming/paper/output/snake/Nadig_asthma/flames+200kb/K20/3000_t_ACAT_resample/p_values/geneset_p_value.rds")
+snp_geneset_p_value_test <- snp_geneset_p_value[which(!grepl("non-",rownames(snp_geneset_p_value))),]
+snp_geneset_p_value_control <- snp_geneset_p_value[which(grepl("non-",rownames(snp_geneset_p_value))),]
+
+df1_long <- snp_geneset_p_value_test %>%
+  as.data.frame() %>%
+  rownames_to_column("snp") %>%      # 这里真正把 rownames 变成一列 snp
+  pivot_longer(
+    -snp,
+    names_to  = "module",
+    values_to = "p_snp_geneset"
+  )
+
+## 2. 模块层面的表，只保留需要的列
+df2 <- module_results %>%
+  dplyr::select(module, p_fisher,snp)
+
+## 3. 按 module 合并，再调整列顺序
+merged <- df1_long %>%
+  left_join(df2, by = c("snp", "module")) %>%  # 关键改动
+  relocate(snp, module, p_snp_geneset, p_fisher)%>% tidyr::drop_na()
+
+
+# library(dplyr)
+# 
+# df1 <- as.data.frame(snp_geneset_p_value)
+# df1$snp <- rownames(df1)
+# 
+# df1_long <- df1 %>%
+#   pivot_longer(-snp, names_to = "module", values_to = "p_snp_geneset")
+# 
+# ## 图二：geneset_acat_pvals_M1.0001（列：module, p_acat）
+# df2 <- geneset_acat_pvals_M1.0001 %>%
+#   dplyr::select(module, p_fisher)
+# 
+# merged <- df1_long %>%
+#   left_join(df2, by = "module") %>%
+#   relocate(snp, module, p_snp_geneset, p_fisher)
+# 
+# 
+
+X <- merged[,c(3,4)]
+
+library(adaFilter)
+
+result <- adaFilter(X, r = 2,alpha=0.1)
+
+merged$decision <- result$decision
+colnames(merged)[c(3,4)] <- c("snp_geneset","geneset_trait")
+
+head(merged[merged$decision==1,])
+```
+
+
+```{r,fig.width=15,fig.height=15}
+
+dfl2 <- merged[merged$decision==1,]
+dfl2$gene_name <- dfl2$snp
+
+```
+```{r}
+result <- readRDS("/project/xuanyao/jiaming/Getting_started/data/GWAS/asthma/GCST010043/flames+200kb/result.rds")
+symbol_to_rsid <- result %>%         # 你的 1251×7 表
+  filter(!is.na(symbol)) %>%
+  dplyr::select(symbol, rsid) %>%
+  distinct()
+
+# ── 2. 把 rsid 加入 tbl_df ───────────────────────────────
+tbl_with_rsid <- dfl2 %>%
+  left_join(symbol_to_rsid, by = c("snp" = "symbol"))
+
+# ── 3. 按 rsid 分组合并 ──────────────────────────────────
+# 没有 rsid 匹配的行（rsid = NA）保持原样，snp 不变
+merged_df <- tbl_with_rsid %>%
+  group_by(rsid, module) %>%
+  mutate(
+    merged_snp = ifelse(
+      all(is.na(rsid)),
+      snp,
+      paste0(
+        paste(sort(unique(snp)), collapse = "-"),
+        " (", rsid[!is.na(rsid)][1], ")"
+      )
+    )
+  ) %>%
+  ungroup() %>%
+  group_by(merged_snp, module) %>%
+  summarise(
+    snp_geneset   = min(snp_geneset,   na.rm = TRUE),
+    geneset_trait = min(geneset_trait, na.rm = TRUE),
+    decision      = max(decision,      na.rm = TRUE),
+    gene_name     = paste(sort(unique(gene_name)), collapse = "-"),
+    .groups       = "drop"
+  ) 
+
+merged_df$gene_name <- merged_df$merged_snp
+```
+
+
+```{r}
+head(merged_df)
+```
+
+
+```{r}
+flames_symbols <- result %>%
+  filter(source == "FLAMES") %>%
+  pull(symbol) %>%
+  unique() %>%
+  na.omit()
+
+# 检查 merged_df 的 snp 列中是否包含这些 symbol
+# merged_snp 格式如 "RPS18-SLC39A7 (rs411919)"，需要拆解出 symbol 部分
+highlight_genes <- merged_df %>%
+  filter(
+    sapply(merged_snp, function(s) {
+      # 提取括号前的 symbol 部分，按 "-" 拆分
+      sym_part <- sub("\\s*\\(.*\\)$", "", s)       # 去掉 " (rsXXX)"
+      syms     <- strsplit(sym_part, "-")[[1]]       # 拆分多个 symbol
+      any(syms %in% flames_symbols)                  # 任一 symbol 在 FLAMES 中
+    })
+  )
+
+cat("FLAMES_genes 行数:", nrow(highlight_genes), "\n")
+print(highlight_genes)
+```
+
+
+
+
+```{r,fig.width=14,fig.height=14}
+
+plot_gene_module_network2(
+  merged_df,
+  top_n_gene = 200,
+  size_scale = 1,
+  highlight_genes = character(0),
+    highlight_mod = character(0),
+  gene_modules_id = gene_modules_id,   # <- 传入
+
+  layout_fun = igraph::layout_with_fr   # 关键：显式用 igraph 的
+)
+```
+
+# Asthma_CDT4
+
+```{r}
+library(data.table)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(heavytailcombtest)
+
+# -----------------------------
+# 0) Read inputs
+# -----------------------------
+df <- fread("/project/xuanyao/jiaming/Getting_started/data/geneset_to_trait/asthma/asthma.tsv")
+df2 <- df[grepl("M1.01", df$Name), ]
+
+Nadig_associated_perturbation <- readRDS("/project/xuanyao/jiaming/Getting_started/data/GWAS/asthma/GCST010043/flames+200kb/CDT4_associated_perturbation.rds")
+
+
+
+discovery_pairs_cis <- readRDS("/project/xuanyao/jiaming/Getting_started/data/Nadig/discovery_pairs_cis.rds")
+
+
+ # gene_modules_id <- readRDS("/project/xuanyao/jiaming/Getting_started/data/Nadig/topic_geneset/flames+200kb/de_20_0.01_2_0.5.rds")
+ 
+ gene_modules_id<-filtered_list_2
+
+
+
+
+# -----------------------------
+# 1) Build pv_map from df2
+# -----------------------------
+gene_id <- str_extract(df2$Name, "^[^(]+(?=\\()")
+
+lookup <- df2 %>%
+  mutate(ID = gene_id) %>%
+  filter(!is.na(ID), !is.na(p_value)) %>%
+  group_by(ID) %>%
+  summarise(p_value = min(p_value), .groups = "drop")
+
+pv_map <- setNames(lookup$p_value, lookup$ID)
+
+
+# -----------------------------
+# 2) Helpers
+# -----------------------------
+clean_p <- function(p) {
+  p <- as.numeric(p)
+  p[is.na(p) | p <= 0] <- NA
+  p
+}
+
+safe_comb <- function(p) {
+  p <- as.numeric(p)
+  p <- p[!is.na(p) & p > 0 & p <= 1]
+  if (length(p) == 0) return(NA_real_)
+  if (length(p) == 1) return(p)
+
+  combination.test(
+    p,
+    weights = NA,
+    method = "Cauchy",
+    tail.idx = 1
+  )
+}
+
+safe_comb_fisher <- function(p) {
+  p <- as.numeric(p)
+  p <- p[!is.na(p) & p > 0 & p <= 1]
+  if (length(p) == 0) return(NA_real_)
+  if (length(p) == 1) return(p)
+
+  stat <- -2 * sum(log(p))
+  stats::pchisq(stat, df = 2 * length(p), lower.tail = FALSE)
+}
+
+
+# -----------------------------
+# 3) Make filtered modules per perturbation (and record n_removed)
+# -----------------------------
+make_filtered_modules <- function(gene_symbol, gene_modules_id, pairs_df) {
+  target_name <- paste0("tar-",gene_symbol)
+
+  ids_to_remove <- unique(pairs_df$response_id[pairs_df$grna_target == target_name])
+
+  filtered_modules <- lapply(gene_modules_id, function(mod_ids) {
+    setdiff(mod_ids, ids_to_remove)
+  })
+
+  list(
+    modules   = filtered_modules,
+    n_removed = length(ids_to_remove)
+  )
+}
+
+filtered_by_perturbation <- setNames(
+  lapply(
+    Nadig_associated_perturbation,
+    make_filtered_modules,
+    gene_modules_id = gene_modules_id,
+    pairs_df = discovery_pairs_cis
+  ),
+  Nadig_associated_perturbation
+)
+
+
+# -----------------------------
+# 4) Compute module-level combined p-values per perturbation
+#    (and add n_removed into module_results)
+# -----------------------------
+compute_for_one_pert <- function(pert) {
+  obj <- filtered_by_perturbation[[pert]]
+  gene_modules_id_pert <- obj$modules
+  n_removed <- obj$n_removed
+
+  # module -> p-values vector under this perturbation
+  module_pvals <- lapply(gene_modules_id_pert, function(genes) {
+    p <- pv_map[genes]
+    names(p) <- genes
+    p[!is.na(p)]
+  })
+
+  # combine within each module
+  p_acat <- map_dbl(module_pvals, ~ {
+    p <- clean_p(.x)
+    if (!length(p)) return(NA_real_)
+    as.numeric(safe_comb(p))
+  })
+
+  p_fisher <- map_dbl(module_pvals, ~ {
+    p <- clean_p(.x)
+    if (!length(p)) return(NA_real_)
+    as.numeric(safe_comb_fisher(p))
+  })
+
+  tibble(
+    snp       = pert,
+    n_removed = n_removed,  # ✅ 每个 perturbation 的 ids_to_remove 数量（复制到每一行 module）
+    module    = names(module_pvals),
+    n_genes   = lengths(gene_modules_id_pert),
+    n_matched = sapply(module_pvals, function(v) sum(!is.na(v))),
+    p_acat    = p_acat,
+    p_fisher  = p_fisher
+  )
+}
+
+module_results <- map_dfr(Nadig_associated_perturbation, compute_for_one_pert)
+
+# 查看结果
+module_results %>%
+  arrange(p_fisher) %>%
+  print(n = 30)
+
+```

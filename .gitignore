@@ -1,0 +1,24 @@
+# All computation outputs
+output/
+simulation_data/
+
+# Binary data files
+**/*.rds
+**/*.RData
+**/*.rda
+
+# Snakemake cache and logs
+**/.snakemake/
+**/logs/
+**/snakemake_benchmarks/
+
+# Job logs
+code/rcc_err/
+**/*.err
+**/*.out
+
+# Claude / IDE config
+**/.claude/
+
+# OS
+.DS_Store

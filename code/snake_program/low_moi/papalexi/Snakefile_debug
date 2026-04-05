@@ -1,0 +1,73 @@
+configfile: "config/config.yaml"
+dscp = config["description"]
+data_dir = config["data_dir"]
+n_guides = config["n_guides"]
+guide_to_analyze  = list(range(1, n_guides+1))
+
+
+rule all:
+    input:
+        expand("/project/xuanyao/jiaming/paper/output/{description}/p_values/geneset_p_value.rds", description=dscp),
+        expand("/project/xuanyao/jiaming/paper/output/{description}/p_values/genewise_p_value.rds", description=dscp)
+
+rule prepare_log_dir:
+  output:
+    "snakemake_benchmarks/{description}/.init"
+  shell:
+    """
+    mkdir -p snakemake_benchmarks/{wildcards.description} && touch snakemake_benchmarks/{wildcards.description}/.init
+    """
+
+
+
+rule compute_guide:
+    input:
+        grna_target_dataframe = lambda wc: f"{config['data_dir']}/grna_target_dataframe.rds",
+        gene_module_index_matrix = lambda wc: f"{config['data_dir']}/gene_module_index_matrix.rds",
+        discovery_pairs_cis = lambda wc: f"{config['data_dir']}/discovery_pairs_cis.rds",
+        response_matrix_NTC = lambda wc: f"{config['data_dir']}/hallmark_response_union_guide/normalized_hallmark_NTC_response_matrix.rds",
+        covariate_NTC = lambda wc: f"{config['data_dir']}/hallmark_response_union_guide/NTC_covariate.rds",
+        non_targeting_guide = lambda wc: f"{config['data_dir']}/hallmark_response_union_guide/non_targeting_guide.rds",
+        grna_names = lambda wc: f"{config['data_dir']}/hallmark_response_union_guide/grna_names.rds",
+        ntc_guide_length = f"{config['data_dir']}/hallmark_response_union_guide/ntc_guide_length.rds",
+        response_matrix = lambda wc: f"{config['data_dir']}/hallmark_response_union_guide/union_response_matrix_{wc.chunk}.rds",
+        covariate = lambda wc: f"{config['data_dir']}/hallmark_response_union_guide/union_covariate_{wc.chunk}.rds"
+    params:
+        n_permute = config["n_permute"],
+        test_type = config["test_type"],
+        use_resample = config["use_resample"],
+        trt_cells_cutoff = config["trt_cells_cutoff"],
+        control_cells_cutoff = config["control_cells_cutoff"],
+        use_approximation = config["use_approximation"],
+        use_approximation_gene = config["use_approximation_gene"],
+        approximation_type = config["approximation_type"],
+        approximation_threshold = config["approximation_threshold"],
+        moi = config["moi"],
+        use_ACAT = config["use_ACAT"],
+        guide_or_target = config["guide_or_target"]
+
+    output:
+        geneset_p_value = temp("/project/xuanyao/jiaming/Getting_started/output/{description}/p_values/geneset_p_value_grna_id_{chunk}.rds"),
+        genewise_p_value = temp("/project/xuanyao/jiaming/Getting_started/output/{description}/p_values/genewise_p_value_grna_id_{chunk}.rds")
+
+    benchmark:
+        "snakemake_benchmarks/{description}/compute_guide_{chunk}.txt"
+    script:
+        "../../scripts/papalexi_all_in_one.R"
+
+
+
+rule bind_all_p_value:
+    input:
+        geneset_files = expand("/project/xuanyao/jiaming/Getting_started/output/{{description}}/p_values/geneset_p_value_grna_id_{chunk}.rds",
+                          chunk=guide_to_analyze),
+        genewise_files = expand("/project/xuanyao/jiaming/Getting_started/output/{{description}}/p_values/genewise_p_value_grna_id_{chunk}.rds",
+                           chunk=guide_to_analyze)
+    output:
+        geneset_merged = "/project/xuanyao/jiaming/paper/output/{description}/p_values/geneset_p_value.rds",
+        genewise_merged = "/project/xuanyao/jiaming/paper/output/{description}/p_values/genewise_p_value.rds"
+
+    benchmark:
+        "snakemake_benchmarks/{description}/bind_all_p_value.txt"
+    script:
+        "../../scripts/bind_all_p_value.R"

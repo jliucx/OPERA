@@ -1,0 +1,1250 @@
+---
+title: "simulation"
+output: html_document
+date: "2026-02-01"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(splatter)
+library(SingleCellExperiment)
+library(Matrix)
+library(Rcpp)
+
+source("/project/xuanyao/jiaming/OPERA/scripts/functions_optimized.R")
+sourceCpp("/project/xuanyao/jiaming/OPERA/scripts/fit_skew_normal.cpp")
+sourceCpp("/project/xuanyao/jiaming/OPERA/scripts/crt_sample.cpp")
+
+
+
+simulate_perturbseq_splatter_restrict_DE <- function(
+  n_genes = 10000,
+  n_cells = 10000,
+  infected_frac = 0.20,
+  down_gene_frac = 0.70,      # 这里更准确叫 de_gene_frac（DE比例），但我保持你原名
+  effect_fc = 2,
+  effect_sdlog = 0.10,
+  de_pool_n = 100,
+  up_prob = 0.5               # DE gene 上调概率（其余为下调）
+) {
+  stopifnot(de_pool_n <= n_genes, de_pool_n > 0)
+  stopifnot(infected_frac > 0 && infected_frac < 1)
+  stopifnot(down_gene_frac >= 0 && down_gene_frac <= 1)
+  stopifnot(effect_fc >= 1)
+  stopifnot(up_prob >= 0 && up_prob <= 1)
+
+  params <- newSplatParams(nGenes = n_genes, batchCells = n_cells)
+
+  sce <- splatSimulateGroups(
+    params,
+    group.prob  = c(1 - infected_frac, infected_frac),
+    de.prob     = c(0, 0),
+    verbose = FALSE
+  )
+
+  infected <- (colData(sce)$Group == "Group2")
+  colData(sce)$infected <- infected
+  colData(sce)$gRNA <- ifelse(infected, "gRNA_sim", "NTC")
+
+  # 2) only sample DE genes from 1:de_pool_n
+  n_de <- round(de_pool_n * down_gene_frac)
+  de_idx <- sort(sample.int(de_pool_n, n_de))
+  de_genes <- rep(FALSE, n_genes)
+  de_genes[de_idx] <- TRUE
+
+  # 3) assign random direction + effect size
+  #    fc_vals >= 1 roughly centered around effect_fc
+  de_factor <- rep(1, n_genes)     # multiplicative factor on mean
+  de_dir <- rep(0L, n_genes)       # +1 up, -1 down, 0 non-DE
+
+  if (n_de > 0) {
+    fc_vals <- rlnorm(n_de, meanlog = log(effect_fc), sdlog = effect_sdlog)
+    is_up <- rbinom(n_de, size = 1, prob = up_prob) == 1
+
+    # up: *fc, down: /fc
+    signed_fac <- ifelse(is_up, fc_vals, 1 / fc_vals)
+
+    de_factor[de_idx] <- signed_fac
+    de_dir[de_idx] <- ifelse(is_up, 1L, -1L)
+  }
+
+  # 4) rebuild mu and resample counts
+  Y0 <- counts(sce)
+  lib <- Matrix::colSums(Y0); lib <- lib / mean(lib)
+
+  ctrl <- !infected
+  gene_mu <- rowMeans(Y0[, ctrl, drop = FALSE])
+
+  mu <- outer(gene_mu, lib)
+
+  if (any(infected) && n_de > 0) {
+    mu[de_idx, infected] <- mu[de_idx, infected] * de_factor[de_idx]
+  }
+
+  nb_size <- 10
+  Y <- matrix(
+    rnbinom(n_genes * n_cells, mu = as.vector(mu), size = nb_size),
+    nrow = n_genes, ncol = n_cells
+  )
+  Y <- Matrix(Y, sparse = TRUE)
+  rownames(Y) <- paste0("gene", seq_len(n_genes))
+  colnames(Y) <- paste0("cell", seq_len(n_cells))
+
+  grna_assignment_matrix <- Matrix(as.integer(infected), nrow = 1, ncol = n_cells, sparse = TRUE)
+  rownames(grna_assignment_matrix) <- "gRNA_sim"
+  colnames(grna_assignment_matrix) <- colnames(Y)
+
+  list(
+    Y = Y,
+    infected = infected,
+    de_genes = de_genes,
+    de_idx = de_idx,
+    de_factor = de_factor,   # >1 up, <1 down
+    de_dir = de_dir,         # +1 up, -1 down
+    grna_assignment_matrix = grna_assignment_matrix
+  )
+}
+```
+
+
+```{r}
+sim <- simulate_perturbseq_splatter_restrict_DE(
+  n_genes=5000, n_cells=10000,
+  infected_frac=0.01, down_gene_frac=0.2,
+  effect_fc=1.1, effect_sdlog=0,
+  de_pool_n=100, up_prob=0.5
+)
+
+
+
+```
+
+
+
+```{r}
+
+grna_target_data_frame <- readRDS("/project/xuanyao/jiaming/paper/simulation_data/grna_target_dataframe.rds")
+
+discovery_pairs <- readRDS("/project/xuanyao/jiaming/paper/simulation_data/discovery_pairs.rds")
+
+sceptre_object <- import_data(
+  response_matrix = sim$Y,
+  grna_matrix = sim$grna_assignment_matrix,
+  grna_target_data_frame = grna_target_data_frame,
+  moi = "high"
+
+)
+
+
+```
+
+
+```{r}
+
+sceptre_object <- sceptre_object |>
+  set_analysis_parameters(
+    discovery_pairs = discovery_pairs,
+    side = "both",
+    multiple_testing_alpha=0.05,
+    control_group = "complement",
+    resampling_mechanism = "crt",
+    formula=formula(~ log(response_n_nonzero) + log(response_n_umis)),
+    grna_integration_strategy = "singleton"
+  ) |>
+  assign_grnas(method = "thresholding",
+               threshold = 1) |>
+  run_qc(n_nonzero_trt_thresh=0,n_nonzero_cntrl_thresh=0) |>
+    run_discovery_analysis(parallel = T)
+```
+
+```{r}
+discovery_result <- get_result(
+  sceptre_object = sceptre_object,
+  analysis = "run_discovery_analysis"
+)
+```
+
+```{r}
+ACAT(discovery_result$p_value)
+```
+```{r}
+response_matrix  <- t(t(sim$Y) / sceptre_object@covariate_data_frame[, "response_n_umis"])[1:100,]
+covariate <- as.data.frame(sceptre_object@covariate_matrix[,c(2,3)])
+
+```
+
+```{r}
+OPERA<-function(response_matrix,covariate,grna_assignment_matrix,n_permute){
+  
+  grna_assignment_matrix_combined <- permutation_or_resampling(grna_assignment_matrix, n_permute, covariate, use_resample=T)
+  test_result <- t_test_wilcoxon(response_matrix, grna_assignment_matrix_combined)
+  normalized_test_tensor <- test_normalizer_rcpp(
+    convert_matrix_to_tensor(test_result,
+    n_permute,
+    grna_assignment_matrix)
+  )
+  gene_module_index_matrix <- matrix(1,nrow=100,ncol=1)
+  colnames(gene_module_index_matrix) <- "GENESET"
+  combined_test_tensor <- combine_test_statistics_tensor_low_RAM(normalized_test_tensor, gene_module_index_matrix)
+  
+  
+  precompute_p <- compute_final_p_val(combined_test_tensor, n_permute,1)
+
+  
+
+    threshold <- 0.05
+    
+    indices <- which(!is.na(precompute_p) & precompute_p < threshold, arr.ind = TRUE)
+    
+    if (length(indices) > 0) {
+      for (k in seq_len(nrow(indices))) {
+        i <- indices[k, 2]
+        j <- indices[k, 1]
+        
+        p_value_1 <- combined_test_tensor[-1, i, j]
+        p_value_2 <- combined_test_tensor[1, i, j]
+        p_value_1 <- p_value_1[is.finite(p_value_1)]
+        
+        
+        if (length(p_value_1) <= 1 || length(unique(p_value_1)) <= 1) {
+          result <- 1
+        } else {
+          
+
+            result <- fit_and_evaluate_skew_t(p_value_1,p_value_2,1)
+  
+        }
+        precompute_p[j, i] <- result
+      }
+    } else {
+      print("No indices meet the condition precompute_p < threshold")
+    }
+  
+  
+ 
+  
+  rownames(precompute_p)<- rownames(grna_assignment_matrix)
+
+  
+  
+  ACAT_p <- combine_p_using_ACAT(precompute_p)
+  return(ACAT_p)
+
+}
+```
+
+```{r}
+str(OPERA(response_matrix,covariate,grna_assignment_matrix,3000))
+class(OPERA(response_matrix,covariate,grna_assignment_matrix,3000))
+```
+
+```{r}
+
+############################################
+## Libraries + C++ sources
+############################################
+
+suppressPackageStartupMessages({
+  library(splatter)
+  library(SingleCellExperiment)
+  library(Matrix)
+  library(Rcpp)
+  library(sceptre)
+  library(readr)
+  library(dplyr)
+  library(parallel)
+  library(BH)
+  library(peakRAM)
+  library(speedglm)
+  library(matrixStats)
+  library(heavytailcombtest)
+  library(ACAT)
+  # library(sgt)   # <- 如果没装会报错；需要的话再打开
+})
+
+source("/project/xuanyao/jiaming/OPERA/scripts/functions_optimized.R")
+sourceCpp("/project/xuanyao/jiaming/OPERA/scripts/fit_skew_normal.cpp")
+sourceCpp("/project/xuanyao/jiaming/OPERA/scripts/crt_sample.cpp")
+
+
+############################################
+## Splatter simulate function (group DE)
+############################################
+
+simulate_perturbseq_splatter <- function(
+    n_genes = 100,
+    n_cells = 10000,
+    infected_frac = 0.20,
+    down_gene_frac = 0.70,
+    effect_fc = 2,
+    effect_sdlog = 0.10
+) {
+  stopifnot(infected_frac > 0 && infected_frac < 1)
+  stopifnot(down_gene_frac >= 0 && down_gene_frac <= 1)
+  stopifnot(effect_fc >= 1)
+  
+  params <- newSplatParams(nGenes = n_genes, batchCells = n_cells)
+  
+  sce <- splatSimulateGroups(
+    params,
+    group.prob  = c(1 - infected_frac, infected_frac),
+    de.prob     = c(0, down_gene_frac),
+    de.downProb = c(0, 1),              # infected 组：DE 基因全部下调
+    de.facLoc   = log(effect_fc),       # 标量：DE factor 的中心
+    de.facScale = effect_sdlog,
+    verbose = FALSE
+  )
+  
+  infected <- (colData(sce)$Group == "Group2")
+  Y <- counts(sce)
+  rownames(Y) <- paste0("gene", seq_len(n_genes))
+  colnames(Y) <- paste0("cell", seq_len(n_cells))
+  grna_assignment_matrix <- Matrix(
+    as.integer(infected),
+    nrow = 1, ncol = n_cells, sparse = TRUE
+  )
+  rownames(grna_assignment_matrix) <- "gRNA_sim"
+  colnames(grna_assignment_matrix) <- colnames(Y)
+  
+  list(
+    sce = sce,
+    Y = Y,
+    infected = infected,
+    grna_assignment_matrix = grna_assignment_matrix
+  )
+}
+
+
+############################################
+## OPERA wrapper: returns numeric p-value
+############################################
+
+OPERA <- function(response_matrix, covariate, grna_assignment_matrix, n_permute) {
+  
+  grna_assignment_matrix_combined <- permutation_or_resampling(
+    grna_assignment_matrix, n_permute, covariate, use_resample = TRUE
+  )
+  
+  test_result <- t_test_wilcoxon(response_matrix, grna_assignment_matrix_combined)
+  
+  normalized_test_tensor <- test_normalizer_rcpp(
+    convert_matrix_to_tensor(test_result, n_permute, grna_assignment_matrix)
+  )
+  
+  gene_module_index_matrix <- matrix(1, nrow = n_genes, ncol = 1)
+  colnames(gene_module_index_matrix) <- "GENESET"
+  
+  combined_test_tensor <- combine_test_statistics_tensor_low_RAM(
+    normalized_test_tensor, gene_module_index_matrix
+  )
+  
+  precompute_p <- compute_final_p_val(combined_test_tensor, n_permute, 1)
+  
+  threshold <- 0.05
+  indices <- which(!is.na(precompute_p) & precompute_p < threshold, arr.ind = TRUE)
+  
+  if (length(indices) > 0) {
+    for (k in seq_len(nrow(indices))) {
+      i <- indices[k, 2]
+      j <- indices[k, 1]
+      
+      p_value_1 <- combined_test_tensor[-1, i, j]
+      p_value_2 <- combined_test_tensor[ 1, i, j]
+      p_value_1 <- p_value_1[is.finite(p_value_1)]
+      
+      if (length(p_value_1) <= 1 || length(unique(p_value_1)) <= 1) {
+        result <- 1
+      } else {
+        result <- fit_and_evaluate_skew_t(p_value_1, p_value_2, 1)
+      }
+      
+      precompute_p[j, i] <- result
+    }
+  } else {
+    message("No indices meet the condition precompute_p < threshold")
+  }
+  
+  rownames(precompute_p) <- rownames(grna_assignment_matrix)
+  
+  ACAT_p <- combine_p_using_ACAT(precompute_p)
+  as.numeric(ACAT_p)[1]
+}
+
+
+############################################
+## Output paths + data
+############################################
+
+n_sim <- 20
+n_genes <- 200
+n_cells <- 10000
+infected_frac <- 0.01
+down_gene_frac <- 0.1
+effect_fc <- 1
+effect_sdlog <- 0
+n_permute_opera <- 3000
+
+
+out_log  <- paste0("/project/xuanyao/jiaming/paper/output/simulation/",100*down_gene_frac,"_density_",effect_fc,"_fc")
+dir.create(out_log, showWarnings = FALSE, recursive = TRUE)
+out_file <- file.path(out_log, "shabisim_log.tsv")
+
+grna_target_data_frame <- readRDS("/project/xuanyao/jiaming/paper/simulation_data/grna_target_dataframe.rds")
+discovery_pairs <- readRDS("/project/xuanyao/jiaming/paper/simulation_data/discovery_pairs.rds")
+
+
+############################################
+## Stable seed per iteration (independent of n_sim)
+############################################
+
+master_seed <- 0L
+seed_i <- function(i, master = master_seed) {
+  as.integer((master + 104729L * i) %% (2^31 - 1L)) + 1L
+}
+
+
+############################################
+## Write header once
+############################################
+
+if (!file.exists(out_file)) {
+  header <- data.frame(
+    sim=integer(), seed=integer(),
+    n_genes=integer(), n_cells=integer(),
+    infected_frac=double(), de_gene_frac=double(),
+    effect_fc=double(), effect_sdlog=double(), n_permute=integer(),
+    n_infected=integer(),
+    ACAT_p=double(), OPERA_p=double(),
+    runtime_sec=double(),
+    ok=integer(), err=character(),
+    stringsAsFactors = FALSE
+  )
+  write.table(header, out_file, sep="\t", row.names=FALSE, col.names=TRUE, quote=FALSE)
+}
+
+
+
+
+############################################
+## Resume logic
+############################################
+
+if (file.exists(out_file)) {
+  done <- read.table(out_file, header=TRUE, sep="\t", stringsAsFactors=FALSE)
+  done_i <- done$sim[done$ok == 1]
+} else {
+  done_i <- integer(0)
+}
+
+
+############################################
+## Main loop
+############################################
+
+for (i in setdiff(seq_len(n_sim), done_i)) {
+  
+  t0 <- Sys.time()
+  
+  row <- tryCatch({
+    
+    seeds <- seed_i(i)
+    set.seed(seeds)
+    
+    sim <- simulate_perturbseq_splatter(
+      n_genes = n_genes, n_cells = n_cells,
+      infected_frac = infected_frac, down_gene_frac = down_gene_frac,
+      effect_fc = effect_fc, effect_sdlog = effect_sdlog
+    )
+    
+    n_infected <- sum(sim$infected)
+    
+    # ---- sceptre ----
+    sceptre_object <- import_data(
+      response_matrix = sim$Y,
+      grna_matrix = sim$grna_assignment_matrix,
+      grna_target_data_frame = grna_target_data_frame,
+      moi = "high"
+    )
+    
+    sceptre_object <- sceptre_object |>
+      set_analysis_parameters(
+        discovery_pairs = discovery_pairs,
+        side = "both",
+        multiple_testing_alpha = 0.05,
+        control_group = "complement",
+        resampling_mechanism = "crt",
+        formula = formula(~ log(response_n_nonzero) + log(response_n_umis)),
+        grna_integration_strategy = "singleton"
+      ) |>
+      assign_grnas(method = "thresholding", threshold = 1) |>
+      run_qc(n_nonzero_trt_thresh = 0, n_nonzero_cntrl_thresh = 0) |>
+      run_discovery_analysis(parallel = TRUE)
+    
+    discovery_result <- get_result(
+      sceptre_object = sceptre_object,
+      analysis = "run_discovery_analysis"
+    )
+    
+    # Avoid exact 1's for ACAT
+    p <- discovery_result$p_value
+    p[p >= 1] <- 0.99999
+    p[p <= 0] <- 1e-250
+    
+    ACAT_p <- as.numeric(ACAT(p))[1]
+    
+    # ---- OPERA ----
+    response_matrix <- t(t(sim$Y) / sceptre_object@covariate_data_frame[, "response_n_umis"])
+    covariate <- as.data.frame(sceptre_object@covariate_matrix[, c(2, 3)])
+    
+    OPERA_p <- OPERA(response_matrix, covariate, sim$grna_assignment_matrix, n_permute_opera)
+    
+    runtime_sec <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+    
+    data.frame(
+      sim=i, seed=seeds,
+      n_genes=n_genes, n_cells=n_cells,
+      infected_frac=infected_frac, de_gene_frac=down_gene_frac,
+      effect_fc=effect_fc, effect_sdlog=effect_sdlog, n_permute=n_permute_opera,
+      n_infected=n_infected,
+      ACAT_p=ACAT_p, OPERA_p=OPERA_p,
+      runtime_sec=runtime_sec,
+      ok=1L, err="",
+      stringsAsFactors = FALSE
+    )
+    
+  }, error = function(e) {
+    
+    runtime_sec <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+    
+    data.frame(
+      sim=i, seed=seed_i(i),
+      n_genes=n_genes, n_cells=n_cells,
+      infected_frac=infected_frac, de_gene_frac=down_gene_frac,
+      effect_fc=effect_fc, effect_sdlog=effect_sdlog, n_permute=n_permute_opera,
+      n_infected=NA_integer_,
+      ACAT_p=NA_real_, OPERA_p=NA_real_,
+      runtime_sec=runtime_sec,
+      ok=0L, err=conditionMessage(e),
+      stringsAsFactors = FALSE
+    )
+  })
+  
+  write.table(row, out_file, sep="\t", row.names=FALSE, col.names=FALSE, quote=FALSE, append=TRUE)
+
+  message("sim ", i, " done; ok=", row$ok,
+          " ACAT=", signif(row$ACAT_p, 3),
+          " OPERA=", signif(row$OPERA_p, 3))
+  
+  print(paste0("finish simulation ", i))
+}
+
+```
+```{r}
+############################################
+## Libraries + C++ sources
+############################################
+
+
+
+
+suppressPackageStartupMessages({
+  library(splatter)
+  library(SingleCellExperiment)
+  library(Matrix)
+  library(Rcpp)
+  library(sceptre)
+  library(readr)
+  library(dplyr)
+  library(parallel)
+  library(BH)
+  library(peakRAM)
+  library(speedglm)
+  library(matrixStats)
+  library(heavytailcombtest)
+  library(ACAT)
+  library(limma)
+    library(edgeR)
+
+  # library(sgt)   # <- 如果没装会报错；需要的话再打开
+})
+
+source("/project/xuanyao/jiaming/OPERA/scripts/functions_optimized.R")
+sourceCpp("/project/xuanyao/jiaming/OPERA/scripts/fit_skew_normal.cpp")
+sourceCpp("/project/xuanyao/jiaming/OPERA/scripts/crt_sample.cpp")
+
+
+args <- commandArgs(trailingOnly = TRUE)
+v <- as.integer(args[1])  # effect_fc index
+u <- as.integer(args[2])  # down_gene_frac index
+
+simulate_perturbseq_splatter <- function(
+    n_genes = 100,
+    n_cells = 10000,
+    infected_frac = 0.20,
+    down_gene_frac = 0.70,
+    effect_fc = 2,
+    effect_sdlog = 0.10
+) {
+  stopifnot(infected_frac > 0 && infected_frac < 1)
+  stopifnot(down_gene_frac >= 0 && down_gene_frac <= 1)
+  stopifnot(effect_fc >= 1)
+  
+  params <- newSplatParams(nGenes = n_genes, batchCells = n_cells)
+  
+  sce <- splatSimulateGroups(
+    params,
+    group.prob  = c(1 - infected_frac, infected_frac),
+    de.prob     = c(0, down_gene_frac),
+    de.downProb = c(0, 0.5),              
+    de.facLoc   = log(effect_fc),       
+    de.facScale = effect_sdlog,
+    verbose = FALSE
+  )
+  
+  infected <- (colData(sce)$Group == "Group2")
+  Y <- counts(sce)
+  rownames(Y) <- paste0("gene", seq_len(n_genes))
+  colnames(Y) <- paste0("cell", seq_len(n_cells))
+  grna_assignment_matrix <- Matrix(
+    as.integer(infected),
+    nrow = 1, ncol = n_cells, sparse = TRUE
+  )
+  rownames(grna_assignment_matrix) <- "gRNA_sim"
+  colnames(grna_assignment_matrix) <- colnames(Y)
+  
+  list(
+    sce = sce,
+    Y = Y,
+    infected = infected,
+    grna_assignment_matrix = grna_assignment_matrix
+  )
+}
+
+
+############################################
+## OPERA wrapper: returns numeric p-value
+############################################
+
+OPERA <- function(response_matrix, covariate, grna_assignment_matrix, n_permute) {
+  
+  grna_assignment_matrix_combined <- permutation_or_resampling(
+    grna_assignment_matrix, n_permute, covariate, use_resample = TRUE
+  )
+  
+  test_result <- t_test_wilcoxon(response_matrix, grna_assignment_matrix_combined)
+  
+  normalized_test_tensor <- test_normalizer_rcpp(
+    convert_matrix_to_tensor(test_result, n_permute, grna_assignment_matrix)
+  )
+  
+  gene_module_index_matrix <- matrix(1, nrow = n_genes, ncol = 1)
+  colnames(gene_module_index_matrix) <- "GENESET"
+  
+  combined_test_tensor <- combine_test_statistics_tensor_low_RAM(
+    normalized_test_tensor, gene_module_index_matrix
+  )
+  
+  precompute_p <- compute_final_p_val(combined_test_tensor, n_permute, 1)
+  
+  threshold <- 0.05
+  indices <- which(!is.na(precompute_p) & precompute_p < threshold, arr.ind = TRUE)
+  
+  if (length(indices) > 0) {
+    for (k in seq_len(nrow(indices))) {
+      i <- indices[k, 2]
+      j <- indices[k, 1]
+      
+      p_value_1 <- combined_test_tensor[-1, i, j]
+      p_value_2 <- combined_test_tensor[ 1, i, j]
+      p_value_1 <- p_value_1[is.finite(p_value_1)]
+      
+      if (length(p_value_1) <= 1 || length(unique(p_value_1)) <= 1) {
+        result <- 1
+      } else {
+        result <- fit_and_evaluate_skew_t(p_value_1, p_value_2, 1)
+      }
+      
+      precompute_p[j, i] <- result
+    }
+  } else {
+    message("No indices meet the condition precompute_p < threshold")
+  }
+  
+  rownames(precompute_p) <- rownames(grna_assignment_matrix)
+  
+  ACAT_p <- combine_p_using_ACAT(precompute_p)
+  as.numeric(ACAT_p)[1]
+}
+
+limma_acat <- function(Y_counts, infected, covariate_df = NULL) {
+  # Y_counts: genes x cells counts
+  # infected: logical length n_cells
+  # covariate_df: data.frame with columns response_n_nonzero, response_n_umis (optional)
+  
+  y <- as.matrix(Y_counts)  # n_genes=100 OK
+  group <- factor(ifelse(infected, "infected", "ctrl"), levels = c("ctrl","infected"))
+  
+  if (is.null(covariate_df)) {
+    design <- model.matrix(~ group)
+  } else {
+    # 用你 sceptre 的 covariates
+    design <- model.matrix(~ group + log(response_n_nonzero) + log(response_n_umis), data = covariate_df)
+  }
+  
+  dge <- edgeR::DGEList(counts = y)
+  dge <- edgeR::calcNormFactors(dge)
+  
+  v <- limma::voom(dge, design, plot = FALSE)
+  fit <- limma::lmFit(v, design)
+  fit <- limma::eBayes(fit)
+  
+  # 取 infected 的系数（groupinfected）
+  coef_name <- "groupinfected"
+  if (!coef_name %in% colnames(fit$coefficients)) {
+    stop("limma: cannot find coef 'groupinfected'. Check design matrix colnames.")
+  }
+  
+  p <- fit$p.value[, coef_name]
+  
+  # ACAT 需要 (0,1) 内的 p
+  p[p >= 1] <- 0.99999
+  p[p <= 0] <- 1e-250
+  
+
+as.numeric(ACAT::ACAT(p))[1]
+  
+}
+
+############################################
+## Output paths + data
+############################################
+master_seed <- 0L
+seed_i <- function(i, master = master_seed) {
+  as.integer((master + 104729L * i) %% (2^31 - 1L)) + 1L
+}
+n_sim <- 4
+n_genes <- 100
+n_cells <- 10000
+infected_frac <- 0.01
+
+down_gene_frac_vec <-c(0.05,0.1,0.2,0.5)
+effect_fc_vec <- c(1.02,1.04,1.06,1.08)
+
+down_gene_frac <- down_gene_frac_vec[1]
+effect_fc <-effect_fc_vec[1]
+# effect_fc <-1
+
+effect_sdlog <- 0
+n_permute_opera <- 100
+
+
+out_log  <- paste0("/project/xuanyao/jiaming/paper/output/simulation_with_limma/",100*down_gene_frac,"_density_",effect_fc,"_fc")
+dir.create(out_log, showWarnings = FALSE, recursive = TRUE)
+out_file <- file.path(out_log, paste0("10000_resample_sim_log_",master_seed,".tsv"))
+
+grna_target_data_frame <- readRDS("/project/xuanyao/jiaming/paper/simulation_data/grna_target_dataframe.rds")
+discovery_pairs <- readRDS("/project/xuanyao/jiaming/paper/simulation_data/discovery_pairs.rds")
+
+
+############################################
+## Stable seed per iteration (independent of n_sim)
+############################################
+
+
+
+
+############################################
+## Write header once
+############################################
+
+if (!file.exists(out_file)) {
+  header <- data.frame(
+    sim=integer(), seed=integer(),
+    n_genes=integer(), n_cells=integer(),
+    infected_frac=double(), de_gene_frac=double(),
+    effect_fc=double(), effect_sdlog=double(), n_permute=integer(),
+    n_infected=integer(),
+    ACAT_p=double(), OPERA_p=double(),Sceptre_bonferoni=double(),Limma_ACAT_p=double(),
+    runtime_sec=double(),
+    ok=integer(), err=character(),
+    stringsAsFactors = FALSE
+  )
+  write.table(header, out_file, sep="\t", row.names=FALSE, col.names=TRUE, quote=FALSE)
+}
+
+
+
+
+############################################
+## Resume logic
+############################################
+
+if (file.exists(out_file)) {
+  done <- read.table(out_file, header=TRUE, sep="\t", stringsAsFactors=FALSE)
+  done_i <- done$sim[done$ok == 1]
+} else {
+  done_i <- integer(0)
+}
+
+
+############################################
+## Main loop
+############################################
+
+for (i in setdiff(seq_len(n_sim), done_i)) {
+
+  
+  t0 <- Sys.time()
+  
+  row <- tryCatch({
+    
+    seeds <- seed_i(i)
+    set.seed(seeds)
+    
+    sim <- simulate_perturbseq_splatter(
+      n_genes = n_genes, n_cells = n_cells,
+      infected_frac = infected_frac, down_gene_frac = down_gene_frac,
+      effect_fc = effect_fc, effect_sdlog = effect_sdlog
+    )
+    
+    n_infected <- sum(sim$infected)
+    
+    print(sum(sim$Y))
+    # ---- sceptre ----
+    sceptre_object <- import_data(
+      response_matrix = sim$Y,
+      grna_matrix = sim$grna_assignment_matrix,
+      grna_target_data_frame = grna_target_data_frame,
+      moi = "high"
+    )
+    
+    sceptre_object <- sceptre_object |>
+      set_analysis_parameters(
+        discovery_pairs = discovery_pairs,
+        side = "both",
+        multiple_testing_alpha = 0.05,
+        control_group = "complement",
+        resampling_mechanism = "crt",
+        formula = formula(~ log(response_n_nonzero) + log(response_n_umis)),
+        grna_integration_strategy = "singleton"
+      ) |>
+      assign_grnas(method = "thresholding", threshold = 1) |>
+      run_qc(n_nonzero_trt_thresh = 0, n_nonzero_cntrl_thresh = 0) |>
+      run_discovery_analysis(parallel = TRUE)
+    
+    discovery_result <- get_result(
+      sceptre_object = sceptre_object,
+      analysis = "run_discovery_analysis"
+    )
+    
+    # Avoid exact 1's for ACAT
+    p <- discovery_result$p_value
+    p[p >= 1] <- 0.99999
+    p[p <= 0] <- 1e-250
+    
+    ACAT_p <- as.numeric(ACAT(p))[1]
+
+    BH_p <- min(1, length(p) * min(p))
+    
+    
+    # ---- OPERA ----
+    response_matrix <- t(t(sim$Y) / sceptre_object@covariate_data_frame[, "response_n_umis"])
+    covariate <- as.data.frame(sceptre_object@covariate_matrix[, c(2, 3)])
+    
+    OPERA_p <- OPERA(response_matrix, covariate, sim$grna_assignment_matrix, n_permute_opera)
+    Limma_ACAT_p <- limma_acat(sim$Y, sim$infected, sceptre_object@covariate_data_frame[, c("response_n_nonzero","response_n_umis")])
+    
+    
+    runtime_sec <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+    
+    data.frame(
+      sim=i, seed=seeds,
+      n_genes=n_genes, n_cells=n_cells,
+      infected_frac=infected_frac, de_gene_frac=down_gene_frac,
+      effect_fc=effect_fc, effect_sdlog=effect_sdlog, n_permute=n_permute_opera,
+      n_infected=n_infected,
+      ACAT_p=ACAT_p, OPERA_p=OPERA_p,Sceptre_bonferoni=BH_p,Limma_ACAT_p=Limma_ACAT_p,
+      runtime_sec=runtime_sec,
+      ok=1L, err="",
+      stringsAsFactors = FALSE
+    )
+    
+  }, error = function(e) {
+    
+    runtime_sec <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+    
+    data.frame(
+      sim=i, seed=seed_i(i),
+      n_genes=n_genes, n_cells=n_cells,
+      infected_frac=infected_frac, de_gene_frac=down_gene_frac,
+      effect_fc=effect_fc, effect_sdlog=effect_sdlog, n_permute=n_permute_opera,
+      n_infected=NA_integer_,
+      ACAT_p=NA_real_, OPERA_p=NA_real_,Sceptre_bonferoni=NA_real_,Limma_ACAT_p=NA_real_,
+      runtime_sec=runtime_sec,
+      ok=0L, err=conditionMessage(e),
+      stringsAsFactors = FALSE
+    )
+  })
+  
+  write.table(row, out_file, sep="\t", row.names=FALSE, col.names=FALSE, quote=FALSE, append=TRUE)
+  
+  message("sim ", i, " done; ok=", row$ok,
+          " ACAT=", signif(row$ACAT_p, 3),
+          " OPERA=", signif(row$OPERA_p, 3))
+  
+  print(paste0("finish simulation ", i))
+}
+
+
+```
+
+# result
+
+```{r}
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(stringr)
+
+})
+
+base_dir <- "/project/xuanyao/jiaming/paper/output/simulation_with_limma"   # 改成你的父目录
+
+folders <- list.dirs(base_dir, full.names = FALSE, recursive = FALSE)
+folders <- folders[str_detect(folders, "^[0-9]+_density_1\\.(02|03|04)_fc$")]
+
+# 2) 解析出 density_num 和 fc_num，并排序
+folder_tbl <- tibble(panel = folders) %>%
+  mutate(
+    density_num = as.integer(str_match(panel, "^([0-9]+)_density_")[,2]),
+    fc_num      = as.numeric(str_match(panel, "_density_([0-9.]+)_fc$")[,2])
+  ) %>%
+  arrange(density_num, fc_num)
+
+folders_sorted <- folder_tbl$panel
+files <- file.path(base_dir, folders_sorted, "10000_resample_sim_log_0.tsv")
+
+# 只保留存在的 tsv
+ok <- file.exists(files)
+folders_sorted <- folders_sorted[ok]
+files <- files[ok]
+if (length(files) == 0) stop("No 10000_resample_sim_log_0.tsv found under: ", base_dir)
+read_one <- function(file, panel){
+  df <- read_tsv(file, show_col_types = FALSE)
+  if ("ok" %in% names(df)) df <- df %>% filter(ok == 1)
+
+
+  df2 <- df %>%
+    transmute(
+      Sceptre_ACAT  = as.numeric(ACAT_p),
+      OPERA_p = as.numeric(OPERA_p),
+      Limma_ACAT = as.numeric(Limma_ACAT_p)
+    )
+
+  df2 %>%
+    pivot_longer(everything(), names_to = "method", values_to = "p") %>%
+    group_by(method) %>%                      # ✅ 关键：按方法分别算比例
+    summarise(prop_lt_0.05 = mean(p < 0.05, na.rm = TRUE), .groups="drop") %>%
+    mutate(panel = panel)
+}
+
+res <- bind_rows(Map(read_one, files, folders_sorted))
+res$method <- factor(res$method, levels = c("Limma_ACAT","Sceptre_ACAT","OPERA_p"))
+res_sorted <- res %>%
+  mutate(
+    density_num = as.integer(str_match(panel, "^([0-9]+)_density_")[,2]),
+    fc_num      = as.numeric(str_match(panel, "_density_([0-9]+\\.[0-9]+)_fc$")[,2]),
+    method = factor(method, levels = c("Limma_ACAT","Sceptre_ACAT","OPERA_p")) 
+  ) %>%
+  arrange(density_num, fc_num, method) %>%
+  dplyr::select(-density_num, -fc_num)
+```
+
+
+
+
+
+```{r,fig.width=15,fig.height=10}
+df_line <- res %>%
+  filter(method %in% c("Sceptre_ACAT", "OPERA_p", "Limma_ACAT")) %>%
+  mutate(
+    density = as.integer(str_match(panel, "^([0-9]+)_density_")[,2]),
+    fc = as.numeric(str_match(panel, "_density_([0-9.]+)_fc$")[,2]),
+    fc = factor(sprintf("%.2f", fc), levels = c("1.02","1.03","1.04"))  # ✅ 三个panel顺序
+  ) %>%
+  arrange(fc, density)
+
+ggplot(df_line, aes(x = density, y = prop_lt_0.05, color = method, group = method)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.2) +
+  facet_wrap(~ fc, ncol = 3) +                       # ✅ 3个panel
+  scale_x_continuous(breaks = sort(unique(df_line$density))) +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_color_manual(
+    values = c(
+      "OPERA_p"      = "#1b9e77",
+      "Sceptre_ACAT" = "#d95f02",
+      "Limma_ACAT"   = "lightblue"
+    ),
+    name = "Method"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 0)
+  ) +
+  labs(x = "Density", y = "Power", title = "Power vs Density across fold-changes")
+```
+
+
+
+
+```{r}
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(data.table)
+})
+
+base_dir <- "/project/xuanyao/jiaming/paper/output/simulation_with_limma_all_repress"   # 改成你的父目录
+
+folders <- list.dirs(base_dir, full.names = FALSE, recursive = FALSE)
+folders <- folders[str_detect(folders, "^[0-9]+_density_1\\.(02|04|06)_fc$")]
+
+# 2) 解析出 density_num 和 fc_num，并排序
+folder_tbl <- tibble(panel = folders) %>%
+  mutate(
+    density_num = as.integer(str_match(panel, "^([0-9]+)_density_")[,2]),
+    fc_num      = as.numeric(str_match(panel, "_density_([0-9.]+)_fc$")[,2])
+  ) %>%
+  arrange(density_num, fc_num)
+
+folders_sorted <- folder_tbl$panel
+files <- file.path(base_dir, folders_sorted, "10000_resample_sim_log_0.tsv")
+
+# 只保留存在的 tsv
+ok <- file.exists(files)
+folders_sorted <- folders_sorted[ok]
+files <- files[ok]
+if (length(files) == 0) stop("No 10000_resample_sim_log_0.tsv found under: ", base_dir)
+read_one <- function(file, panel){
+  df <- read_tsv(file, show_col_types = FALSE)
+  if ("ok" %in% names(df)) df <- df %>% filter(ok == 1)
+
+
+  df2 <- df %>%
+    transmute(
+      Sceptre_ACAT  = as.numeric(ACAT_p),
+      OPERA_p = as.numeric(OPERA_p),
+      Limma_ACAT = as.numeric(Limma_ACAT_p)
+    )
+
+  df2 %>%
+    pivot_longer(everything(), names_to = "method", values_to = "p") %>%
+    group_by(method) %>%                      # ✅ 关键：按方法分别算比例
+    summarise(prop_lt_0.05 = mean(p < 0.05, na.rm = TRUE), .groups="drop") %>%
+    mutate(panel = panel)
+}
+
+res <- bind_rows(Map(read_one, files, folders_sorted))
+res$method <- factor(res$method, levels = c("Limma_ACAT","Sceptre_ACAT","OPERA_p"))
+res_sorted <- res %>%
+  mutate(
+    density_num = as.integer(str_match(panel, "^([0-9]+)_density_")[,2]),
+    fc_num      = as.numeric(str_match(panel, "_density_([0-9]+\\.[0-9]+)_fc$")[,2]),
+    method = factor(method, levels = c("Limma_ACAT","Sceptre_ACAT","OPERA_p")) 
+  ) %>%
+  arrange(density_num, fc_num, method) %>%
+  dplyr::select(-density_num, -fc_num)
+```
+
+
+
+
+
+```{r,fig.width=15,fig.height=15}
+df_line <- res %>%
+  filter(method %in% c("Sceptre_ACAT", "OPERA_p", "Limma_ACAT")) %>%
+  mutate(
+    density = as.integer(str_match(panel, "^([0-9]+)_density_")[,2]),
+    fc = as.numeric(str_match(panel, "_density_([0-9.]+)_fc$")[,2]),
+    fc = factor(sprintf("%.2f", fc), levels = c("1.02","1.04","1.06"))  # ✅ 三个panel顺序
+  ) %>%
+  arrange(fc, density)
+
+ggplot(df_line, aes(x = density, y = prop_lt_0.05, color = method, group = method)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.2) +
+  facet_wrap(~ fc, ncol = 3) +                       # ✅ 3个panel
+  scale_x_continuous(breaks = sort(unique(df_line$density))) +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_color_manual(
+    values = c(
+      "OPERA_p"      = "#1b9e77",
+      "Sceptre_ACAT" = "#d95f02",
+      "Limma_ACAT"   = "lightblue"
+    ),
+    name = "Method"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 0)
+  ) +
+  labs(x = "Density", y = "Power", title = "Power vs Density across fold-changes")
+```
+
+
+### NTC
+
+```{r}
+  library(data.table)
+
+p_df <- fread("/project/xuanyao/jiaming/paper/output/simulation_with_limma/5_density_1_fc/10000_resample_sim_log_0.tsv")
+p_opera <- p_df$OPERA_p
+p_sceptre <- p_df$ACAT_p
+p_limma <- p_df$Limma_ACAT_p
+
+gg_qqplot(p_opera,title = "OPERA NTC")
+gg_qqplot(p_sceptre,title = "SCEPTRE+ACAT NTC")
+gg_qqplot(p_limma,title = "LIMMA+ACAT NTC")
+```
+```{r}
+p_df <- fread("/project/xuanyao/jiaming/paper/output/simulation_with_limma/5_density_1.06_fc/10000_resample_sim_log_0.tsv")
+p_opera <- p_df$OPERA_p
+p_sceptre <- p_df$ACAT_p
+p_limma <- p_df$Limma_ACAT_p
+
+mean(p_limma<0.05)
+mean(p_sceptre<0.05)
+mean(p_opera<0.05)
+
+```
+```{r}
+p <- ggplot(res_sorted2, aes(x = method, y = prop_lt_0.05, fill = method)) +
+  geom_col(width = 0.85) +
+  facet_wrap(~ panel, ncol = 4, dir = "v") +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_fill_manual(
+    values = c("Sceptre_ACAT" = "#1b9e77", "OPERA_p" = "#d95f02"),
+    name = "Method"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 25, hjust = 1),
+    legend.position = "bottom"
+  )
+
+# 保存 PNG（推荐）
+ggsave("prop_lt_0.05_panels.png", plot = p, width = 12, height = 9, dpi = 300)
+```
+
+
+
+```{r}
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+})
+
+base_dir <- "/project/xuanyao/jiaming/paper/output/simulation_with_limma"   # 改成你的父目录
+
+folders <- list.dirs(base_dir, full.names = FALSE, recursive = FALSE)
+folders <- folders[str_detect(folders, "^[0-9]+_density_1\\.02_fc$")]
+
+# 2) 解析出 density_num 和 fc_num，并排序
+folder_tbl <- tibble(panel = folders) %>%
+  mutate(
+    density_num = as.integer(str_match(panel, "^([0-9]+)_density_")[,2]),
+    fc_num      = as.numeric(str_match(panel, "_density_([0-9.]+)_fc$")[,2])
+  ) %>%
+  arrange(density_num, fc_num)
+
+folders_sorted <- folder_tbl$panel
+files <- file.path(base_dir, folders_sorted, "10000_resample_sim_log_0.tsv")
+
+# 只保留存在的 tsv
+ok <- file.exists(files)
+folders_sorted <- folders_sorted[ok]
+files <- files[ok]
+if (length(files) == 0) stop("No 10000_resample_sim_log_0.tsv found under: ", base_dir)
+read_one <- function(file, panel){
+  df <- read_tsv(file, show_col_types = FALSE)
+  if ("ok" %in% names(df)) df <- df %>% filter(ok == 1)
+
+
+  df2 <- df %>%
+    transmute(
+      Sceptre_ACAT  = as.numeric(ACAT_p),
+      OPERA_p = as.numeric(OPERA_p),
+      Limma_ACAT = as.numeric(Limma_ACAT_p)
+    )
+
+  df2 %>%
+    pivot_longer(everything(), names_to = "method", values_to = "p") %>%
+    group_by(method) %>%                      # ✅ 关键：按方法分别算比例
+    summarise(prop_lt_0.05 = mean(p < 0.05, na.rm = TRUE), .groups="drop") %>%
+    mutate(panel = panel)
+}
+
+res <- bind_rows(Map(read_one, files, folders_sorted))
+res$method <- factor(res$method, levels = c("Limma_ACAT","Sceptre_ACAT","OPERA_p"))
+res_sorted <- res %>%
+  mutate(
+    density_num = as.integer(str_match(panel, "^([0-9]+)_density_")[,2]),
+    fc_num      = as.numeric(str_match(panel, "_density_([0-9]+\\.[0-9]+)_fc$")[,2]),
+    method = factor(method, levels = c("Limma_ACAT","Sceptre_ACAT","OPERA_p")) 
+  ) %>%
+  arrange(density_num, fc_num, method) %>%
+  dplyr::select(-density_num, -fc_num)
+```
+
+
+
+
+
+```{r,fig.width=7,fig.height=7}
+df_line <- res %>%
+  filter(method %in% c("Sceptre_ACAT", "OPERA_p")) %>%
+  mutate(
+    density = as.integer(str_match(panel, "^([0-9]+)_density_")[,2]),
+    fc = as.numeric(str_match(panel, "_density_([0-9.]+)_fc$")[,2])
+  ) %>%
+  arrange(fc, density)
+
+# 如果你只关心 fc=1.02（你现在的文件夹规则本来就是1.02），可固定一下
+# df_line <- df_line %>% filter(abs(fc - 1.02) < 1e-8)
+
+p<-ggplot(df_line, aes(x = density, y = prop_lt_0.05, color = method)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.2) +
+  scale_x_continuous(breaks = sort(unique(df_line$density))) +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_color_manual(
+    values = c(
+      "OPERA_p" = "#1b9e77",
+      "Sceptre_ACAT"      = "#d95f02"
+    ),
+    name = "Method"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 0)
+  ) +
+  labs(x = "Density", y = "Power")
+
+ggsave("prop_lt_0.05_panels.png", plot = p, width = 12, height = 9, dpi = 600)
+
+```
+
+
