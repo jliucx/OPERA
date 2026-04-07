@@ -943,6 +943,7 @@ head(merged_df)
 
 
 
+
 The 21 significant mediating gene sets identified by AdaFilter (at nominal α = 0.05) are listed below. Functional annotation via g:Profiler (`sig_GO`) reveals five broad categories:
 
 1. **Hemoglobin and erythroid programs** (k2, k4): iron handling, heme metabolism, red blood cell maturation — most directly relevant to MCH (average hemoglobin content per red blood cell).
@@ -1578,6 +1579,240 @@ plot_gene_module_network_MCH(
   out_pdf           = NULL
 )
 dev.off()
+```
+
+
+### Per-module ego networks
+
+For each module, the focal module (square) is placed at the centre; its peripheral gene nodes from `merged_df$summary` (circles) form an inner ring; and any other module that shares at least one peripheral gene is placed in an outer ring (without expanding its own peripheral genes). Colors and edge coloring follow the same logic as `plot_gene_module_network_MCH`.
+
+```{r plot-module-ego-MCH, fig.width=12, fig.height=12}
+plot_module_ego_MCH <- function(focal_module,
+                                 df12,
+                                 sig_GO,
+                                 haemoglobin_genes,
+                                 cell_cycle_genes,
+                                 autophagy_genes,
+                                 unclassified_alpha = 0.3,
+                                 gene_size      = 8,
+                                 focal_size     = 30,
+                                 other_mod_size = 20,
+                                 label_genes    = TRUE,
+                                 label_cex      = 0.55) {
+
+  # ── colour helpers (identical to plot_gene_module_network_MCH) ───────────────
+  mix_hex_colors <- function(hex_vec) {
+    if (length(hex_vec) == 1) return(hex_vec)
+    rgb_mat <- grDevices::col2rgb(hex_vec)
+    avg <- rowMeans(rgb_mat)
+    grDevices::rgb(avg[1], avg[2], avg[3], maxColorValue = 255)
+  }
+  add_alpha <- function(col, alpha) adjustcolor(col, alpha.f = alpha)
+
+  col_haem  <- "#E74C3C"
+  col_cycle <- "#F1C40F"
+  col_auto  <- "#3498DB"
+  default_gene_col   <- "grey60"
+  default_module_col <- "grey10"
+  cat_to_col <- c(haem = col_haem, cycle = col_cycle, auto = col_auto)
+
+  get_gene_color <- function(raw_name) {
+    no_snp     <- trimws(sub("\\s*\\(.*", "", raw_name))
+    pure_names <- unlist(strsplit(no_snp, "-"))
+    cats <- character(0)
+    if (!is.null(haemoglobin_genes) && any(pure_names %in% haemoglobin_genes)) cats <- c(cats, col_haem)
+    if (!is.null(cell_cycle_genes)  && any(pure_names %in% cell_cycle_genes))  cats <- c(cats, col_cycle)
+    if (!is.null(autophagy_genes)   && any(pure_names %in% autophagy_genes))   cats <- c(cats, col_auto)
+    if (length(cats) == 0) return(add_alpha(default_gene_col, unclassified_alpha))
+    add_alpha(mix_hex_colors(cats), 1.0)
+  }
+
+  get_module_color <- function(mod_name) {
+    if (is.null(sig_GO)) return(add_alpha(default_module_col, unclassified_alpha))
+    rows <- sig_GO[sig_GO$module == mod_name, , drop = FALSE]
+    if (nrow(rows) == 0) return(add_alpha(default_module_col, unclassified_alpha))
+    summ <- paste(rows$summary, collapse = " ")
+    cats <- character(0)
+    if (grepl("hemoglobin|haemoglobin", summ, ignore.case = TRUE)) cats <- c(cats, col_haem)
+    if (grepl("cell cycle",             summ, ignore.case = TRUE)) cats <- c(cats, col_cycle)
+    if (grepl("autophagy",              summ, ignore.case = TRUE)) cats <- c(cats, col_auto)
+    if (length(cats) == 0) return(add_alpha(default_module_col, unclassified_alpha))
+    mix_hex_colors(cats)
+  }
+
+  get_gene_categories <- function(raw_name) {
+    no_snp     <- trimws(sub("\\s*\\(.*", "", raw_name))
+    pure_names <- unlist(strsplit(no_snp, "-"))
+    cats <- character(0)
+    if (!is.null(haemoglobin_genes) && any(pure_names %in% haemoglobin_genes)) cats <- c(cats, "haem")
+    if (!is.null(cell_cycle_genes)  && any(pure_names %in% cell_cycle_genes))  cats <- c(cats, "cycle")
+    if (!is.null(autophagy_genes)   && any(pure_names %in% autophagy_genes))   cats <- c(cats, "auto")
+    cats
+  }
+
+  get_module_categories <- function(mod_name) {
+    if (is.null(sig_GO)) return(character(0))
+    rows <- sig_GO[sig_GO$module == mod_name, , drop = FALSE]
+    if (nrow(rows) == 0) return(character(0))
+    summ <- paste(rows$summary, collapse = " ")
+    cats <- character(0)
+    if (grepl("hemoglobin|haemoglobin", summ, ignore.case = TRUE)) cats <- c(cats, "haem")
+    if (grepl("cell cycle",             summ, ignore.case = TRUE)) cats <- c(cats, "cycle")
+    if (grepl("autophagy",              summ, ignore.case = TRUE)) cats <- c(cats, "auto")
+    cats
+  }
+
+  # ── data ─────────────────────────────────────────────────────────────────────
+  focal_rows <- df12 %>% dplyr::filter(module == focal_module)
+  if (nrow(focal_rows) == 0) {
+    message("No genes for module: ", focal_module)
+    return(invisible(NULL))
+  }
+
+  # other modules sharing at least one merged_gene_name with the focal module
+  other_mod_rows <- df12 %>%
+    dplyr::filter(merged_gene_name %in% focal_rows$merged_gene_name,
+                  module != focal_module) %>%
+    dplyr::select(module, merged_gene_name) %>%
+    dplyr::distinct()
+
+  # ── vertices ──────────────────────────────────────────────────────────────────
+  focal_v <- data.frame(name     = focal_module,
+                         vtype    = "focal_module",
+                         gene_raw = NA_character_,
+                         stringsAsFactors = FALSE)
+
+  gene_v <- focal_rows %>%
+    dplyr::transmute(name = summary, vtype = "gene", gene_raw = merged_gene_name)
+
+  other_v <- other_mod_rows %>%
+    dplyr::distinct(module) %>%
+    dplyr::transmute(name = module, vtype = "other_module", gene_raw = NA_character_)
+
+  verts <- dplyr::bind_rows(focal_v, gene_v, other_v)
+
+  # ── edges ─────────────────────────────────────────────────────────────────────
+  edges_focal_gene <- focal_rows %>%
+    dplyr::transmute(from = focal_module, to = summary)
+
+  edges_gene_other <- other_mod_rows %>%
+    dplyr::left_join(
+      focal_rows %>% dplyr::select(merged_gene_name, summary),
+      by = "merged_gene_name",
+      relationship = "many-to-many"
+    ) %>%
+    dplyr::transmute(from = summary, to = module) %>%
+    dplyr::distinct()
+
+  all_edges <- dplyr::bind_rows(edges_focal_gene, edges_gene_other)
+
+  g <- igraph::graph_from_data_frame(all_edges, directed = FALSE, vertices = verts)
+
+  # ── node attributes ───────────────────────────────────────────────────────────
+  is_module_node <- igraph::V(g)$vtype %in% c("focal_module", "other_module")
+  igraph::V(g)$shape       <- ifelse(is_module_node, "square", "circle")
+  igraph::V(g)$frame.color <- NA
+  igraph::V(g)$label.color <- "white"
+
+  igraph::V(g)$color <- vapply(seq_len(igraph::vcount(g)), function(i) {
+    if (igraph::V(g)$vtype[i] == "gene")
+      get_gene_color(igraph::V(g)$gene_raw[i])
+    else
+      get_module_color(igraph::V(g)$name[i])
+  }, character(1))
+
+  igraph::V(g)$size <- ifelse(igraph::V(g)$vtype == "focal_module", focal_size,
+                               ifelse(igraph::V(g)$vtype == "other_module", other_mod_size,
+                                      gene_size))
+
+  igraph::V(g)$label <- ifelse(
+    igraph::V(g)$vtype == "gene",
+    ifelse(label_genes, igraph::V(g)$gene_raw, NA_character_),
+    igraph::V(g)$name
+  )
+  igraph::V(g)$label.cex <- ifelse(igraph::V(g)$vtype == "focal_module", 1.1,
+                                    ifelse(igraph::V(g)$vtype == "other_module", 0.9,
+                                           label_cex))
+
+  # ── edge colours (same logic as plot_gene_module_network_MCH) ────────────────
+  el        <- igraph::get.edgelist(g)
+  vtype_map <- setNames(igraph::V(g)$vtype,    igraph::V(g)$name)
+  vraw_map  <- setNames(igraph::V(g)$gene_raw, igraph::V(g)$name)
+  edge_col  <- character(nrow(el))
+  edge_bold <- logical(nrow(el))
+
+  for (i in seq_len(nrow(el))) {
+    n1 <- el[i, 1]; n2 <- el[i, 2]
+    if (vtype_map[n1] == "gene") { gn <- vraw_map[n1]; mn <- n2 }
+    else                         { gn <- vraw_map[n2]; mn <- n1 }
+    shared <- intersect(get_gene_categories(gn), get_module_categories(mn))
+    if (length(shared) > 0) {
+      edge_col[i]  <- mix_hex_colors(cat_to_col[shared])
+      edge_bold[i] <- TRUE
+    } else {
+      edge_col[i]  <- "grey70"
+      edge_bold[i] <- FALSE
+    }
+  }
+  igraph::E(g)$color <- edge_col
+  igraph::E(g)$width <- ifelse(edge_bold, 3, 1)
+
+  # ── concentric layout: focal (centre) → gene ring (r=1) → other-mod ring (r=2)
+  focal_idx <- which(igraph::V(g)$vtype == "focal_module")
+  gene_idx  <- which(igraph::V(g)$vtype == "gene")
+  other_idx <- which(igraph::V(g)$vtype == "other_module")
+  n_genes   <- length(gene_idx)
+  n_others  <- length(other_idx)
+
+  lay <- matrix(0, nrow = igraph::vcount(g), ncol = 2)
+  lay[focal_idx, ] <- c(0, 0)
+
+  if (n_genes > 0) {
+    th <- seq(0, 2 * pi, length.out = n_genes + 1)[seq_len(n_genes)]
+    lay[gene_idx, 1] <- cos(th)
+    lay[gene_idx, 2] <- sin(th)
+  }
+
+  if (n_others > 0) {
+    # place each other-module near the mean angle of its connected gene nodes
+    gene_angles  <- setNames(atan2(lay[gene_idx, 2], lay[gene_idx, 1]),
+                              igraph::V(g)$name[gene_idx])
+    other_names  <- igraph::V(g)$name[other_idx]
+    for (j in seq_along(other_idx)) {
+      connected_summaries <- other_mod_rows %>%
+        dplyr::filter(module == other_names[j]) %>%
+        dplyr::left_join(focal_rows %>% dplyr::select(merged_gene_name, summary),
+                         by = "merged_gene_name") %>%
+        dplyr::pull(summary)
+      valid_angles <- gene_angles[intersect(connected_summaries, names(gene_angles))]
+      mean_angle <- if (length(valid_angles) > 0)
+        atan2(mean(sin(valid_angles)), mean(cos(valid_angles)))
+      else
+        2 * pi * (j - 1) / n_others
+      lay[other_idx[j], 1] <- 2 * cos(mean_angle)
+      lay[other_idx[j], 2] <- 2 * sin(mean_angle)
+    }
+  }
+
+  plot(g, layout = lay,
+       main = paste("Ego network — module:", focal_module),
+       vertex.label.dist = 0.5,
+       edge.curved = 0.2)
+  invisible(g)
+}
+
+# Draw one ego-network per module present in merged_df
+for (mod in sort(unique(merged_df$module))) {
+  plot_module_ego_MCH(
+    focal_module       = mod,
+    df12               = merged_df,
+    sig_GO             = sig_GO,
+    haemoglobin_genes  = haemoglobin_genes,
+    cell_cycle_genes   = cell_cycle_genes,
+    autophagy_genes    = autophagy_genes,
+    unclassified_alpha = 0.3
+  )
+}
 ```
 
 
@@ -3937,7 +4172,7 @@ Nadig_associated_perturbation <- readRDS("/project/xuanyao/jiaming/Getting_start
 
 
 
-discovery_pairs_cis <- readRDS("/project/xuanyao/jiaming/Getting_started/data/Nadig/discovery_pairs_cis.rds")
+discovery_pairs_cis <- readRDS("/project/xuanyao/jiaming/Getting_started/data/CDT4/standard_input_format_asthma/flames+200kb/discovery_pairs_cis.rds")
 
 
  # gene_modules_id <- readRDS("/project/xuanyao/jiaming/Getting_started/data/Nadig/topic_geneset/flames+200kb/de_20_0.01_2_0.5.rds")
@@ -3999,7 +4234,7 @@ safe_comb_fisher <- function(p) {
 # 3) Make filtered modules per perturbation (and record n_removed)
 # -----------------------------
 make_filtered_modules <- function(gene_symbol, gene_modules_id, pairs_df) {
-  target_name <- paste0("tar-",gene_symbol)
+  target_name <- gene_symbol
 
   ids_to_remove <- unique(pairs_df$response_id[pairs_df$grna_target == target_name])
 
@@ -4072,3 +4307,5 @@ module_results %>%
   print(n = 30)
 
 ```
+
+
