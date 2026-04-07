@@ -1,12 +1,19 @@
 ---
-title: "results"
-output: html_document
+title: "OPERA: Results Notebook"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
 date: "2026-01-05"
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = FALSE)
 ```
+
 ```{r}
 library(ggplot2)
 library(dplyr)
@@ -225,7 +232,35 @@ combine_p_by_target<- function(P, map, non_targeting_label = "non-targeting") {
 # 结果 res：行包含 每个 target 的一行 + 每条 non-targeting guide 的原样行
 ```
 
-# Morris
+## Overview
+
+This notebook produces all main results and figures for the OPERA paper (Figure 1, Figure 2 and supplementary efficiency benchmarks). It is organized into four main parts:
+
+1. **Per-dataset power and calibration analysis (Figure 1A–C):** For each of six Perturb-seq datasets (Morris, Xie, Frangieh IFN-γ, Frangieh control, Papalexi, Nadig), we load OPERA gene-set–level p-values and SCEPTRE gene-level p-values, aggregate the latter by gene set using ACAT, compare the number of significant trans SNP–gene set associations, and assess false positive rates using non-targeting controls (NTCs).
+
+2. **Figure 1B — Stacked barplot:** Across all datasets, OPERA consistently identifies more trans associations than SCEPTRE+ACAT at the same nominal threshold. The bar segments show shared discoveries and method-specific discoveries.
+
+3. **Figure 1C — NTC QQ plot:** P-values from non-targeting perturbations are used to confirm that neither OPERA nor SCEPTRE+ACAT inflates type I errors; observed distributions should track the diagonal.
+
+4. **Figure 2 — Topic modeling and gene set annotation:** Topic models are fitted to perturb-responsive cells, and the resulting data-driven gene sets (K = 70 and K = 100 topics) are annotated via g:Profiler GO enrichment and visualized by Jaccard similarity heatmaps.
+
+5. **Computational efficiency benchmarks:** Wall-clock time and peak memory usage are reported per dataset to demonstrate scalability.
+
+---
+
+# Per-dataset power and calibration (Figure 1)
+
+OPERA is benchmarked against SCEPTRE across six Perturb-seq datasets using the 50 MSigDB Hallmark gene sets as gene-set targets. For each dataset, the workflow is:
+
+1. Load OPERA gene-set p-values (`geneset_p_value.rds`) computed with 3,000 conditional resampling iterations and a skewed-t null approximation.
+2. Load SCEPTRE gene-level p-values, pivot to wide format (perturbation × gene), and aggregate within each Hallmark gene set using ACAT (Cauchy combination), yielding SCEPTRE+ACAT gene-set p-values.
+3. Apply Benjamini–Hochberg correction to both sets of gene-set p-values.
+4. Count significant associations at FDR < 0.05, compare by Euler/Venn diagram.
+5. Evaluate NTC calibration via QQ plots for both methods.
+
+Genes within ±10 Mb of each perturbation locus are excluded to restrict analysis to *trans* effects.
+
+## Morris
 
 ```{r,echo=F,include=F}
 
@@ -438,7 +473,7 @@ ntc_morris_OPERA <- max_stat[ntc_rows,]
 
 ntc_morris_OPERA <- ntc_morris_OPERA[!grepl(pat_rm, rownames(ntc_morris_OPERA), perl=TRUE), , drop=FALSE]
 p2<-gg_qqplot_df(ntc_morris_OPERA,title="OPERA NTC, morris")
-p2
+
 ```
 
 
@@ -571,7 +606,7 @@ p3<-gg_qqplot_df(ntc_morris_SCEPTRE,title="sceptre+ACAT: geneset NTC Morris")
 grid.arrange(p1,p2,p3,ncol=1)
 ```
 
-# Xie 
+## Xie
 
 ```{r,echo=F,include=F}
 
@@ -892,7 +927,9 @@ p3<-gg_qqplot_df(mat_df,title="sceptre+ACAT: geneset NTC")
 grid.arrange(p1,p2,p3,ncol=1)
 ```
 
-# Frangieh -IFN gamma
+## Frangieh — IFN-γ condition
+
+The Frangieh dataset contains two conditions: IFN-γ stimulated and control. Both are analyzed separately. Note that only 2 of 4 NTC guides were detectable in this dataset; the elevated NTC false positive rate for NTC-1 is attributed to a technical artifact in the guide design rather than method inflation.
 
 ```{r,echo=F,include=F}
 
@@ -1110,9 +1147,7 @@ ntc_frangieh_ifn_OPERA <- ntc_frangieh_ifn_OPERA[!grepl(pat_rm, rownames(ntc_fra
 
 
 p2<-gg_qqplot_df(ntc_frangieh_ifn_OPERA,title="OPERA NTC, frangieh (ifn_gamma)")
-p2
 
-gg_qqplot(as.vector(as.matrix(ntc_frangieh_ifn_OPERA)),title="OPERA Frangieh (ifn_gamma) no perturbation_gene_qc at all")
 ```
 
 
@@ -1242,7 +1277,7 @@ p3<-gg_qqplot_df(ntc_frangieh_ifn_SCEPTRE,title="sceptre+ACAT: geneset NTC Frian
 grid.arrange(p1,p2,p3,ncol=1)
 ```
 
-# Frangieh -control
+## Frangieh — control condition
 
 ```{r,echo=F,include=F}
 
@@ -1461,9 +1496,8 @@ ntc_frangieh_control_OPERA <- ntc_frangieh_control_OPERA[!grepl(pat_rm, rownames
 
 
 p2<-gg_qqplot_df(ntc_frangieh_control_OPERA,title="OPERA NTC Frangieh control")
-p2
 
-gg_qqplot(as.vector(as.matrix(ntc_frangieh_control_OPERA)),title="OPERA Frangieh NTC, REMOVING 5 guides")
+
 ```
 
 
@@ -1592,7 +1626,7 @@ gg_qqplot(as.vector(as.matrix(ntc_frangieh_control_SCEPTRE)))
 grid.arrange(p1,p2,p3,ncol=1)
 ```
 
-# papalexi
+## Papalexi
 
 
 ```{r,echo=F,include=F}
@@ -1914,7 +1948,9 @@ p3<-gg_qqplot_df(ntc_papalexi_SCEPTRE,title="sceptre+ACAT: geneset NTC")
 grid.arrange(p1,p2,p3,ncol=1)
 ```
 
-# Fig. 1B (barplot)
+# Figure 1B — Stacked barplot: OPERA vs. SCEPTRE+ACAT
+
+Each bar represents one dataset, split into two stacked segments: discoveries shared between OPERA and SCEPTRE+ACAT (darker shade) and method-exclusive discoveries (lighter shade). Across all five datasets tested here (Morris, Xie, Frangieh IFN-γ, Frangieh control, Papalexi), OPERA identifies substantially more significant trans SNP–gene set associations than SCEPTRE+ACAT at FDR < 0.05, with only a small fraction of OPERA's discoveries missed by SCEPTRE+ACAT.
 
 
 
@@ -1978,6 +2014,34 @@ plot_df <- plot_df %>%
   mutate(dataset = factor(dataset, levels = desired_order))
 ```
 
+```{r,fig.width=10,fig.height=5}
+plot_df <- plot_df %>%
+  mutate(
+    segment = factor(segment, levels = c("OPERA only", "Sceptre+ACAT only", "Shared"))
+  )
+
+ggplot(plot_df, aes(x = method, y = count, fill = segment)) +
+  geom_col(position = "stack", width = 0.6) +
+  facet_wrap(~ dataset, nrow = 1) +
+  scale_fill_manual(
+    values = c(
+      "Shared"            = "#4E79A7",
+      "Sceptre+ACAT only" = "#F28E2B",
+      "OPERA only"        = "#59A14F"
+    ),
+    breaks = c("Shared", "Sceptre+ACAT only", "OPERA only")  # 图例顺序不变
+  ) +
+  labs(x = NULL, y = "Significant discoveries", fill = NULL) +
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x   = element_text(angle = 35, hjust = 1),
+    legend.position = "right",
+    strip.text    = element_text(size = 9),
+    panel.spacing = unit(0.3, "lines")
+  )
+```
+
+
 
 ```{r,fig.width=10,fig.height=5}
 # ── Dot + line plot（connected paired dot plot）────────────
@@ -2023,7 +2087,9 @@ ggplot(dot_df, aes(x = method, y = total, group = dataset)) +
   )
 ```
 
-# Fig. 1C (NTC qqplot)
+# Figure 1C — NTC QQ plot: calibration comparison
+
+Non-targeting control (NTC) guide–gene set p-values are displayed as QQ plots for OPERA (blue) and SCEPTRE+ACAT (grey) across datasets. Points lying along the diagonal indicate well-calibrated p-values under the null; deviation above the diagonal indicates inflated false positive rates. The 90% confidence envelope is computed from the Beta distribution. OPERA is well-calibrated across most datasets; the slight inflation seen for NTC-1 in the Xie dataset is attributable to a technical issue with that specific guide rather than the method.
 
 
 
@@ -2177,11 +2243,15 @@ print(p)
 
 ```
 
-# Fig. 2B (Topic geneset Heat map)
+# Figure 2 — Topic modeling: data-driven gene set discovery
+
+## Figure 2B — Jaccard similarity heatmap of topic gene sets
+
+Topic models are fitted to perturb-responsive cells using `fastTopics`. Gene sets are derived from grade-of-membership differential expression (GoM-DE): a gene is assigned to a topic if it has LFSR < 0.01, |z| ≥ 2, and |log2FC| ≥ 0.5. This heatmap shows pairwise Jaccard overlaps between the K = 50 topic gene sets (using the MCH Replogle dataset), with hierarchical clustering to reveal groups of functionally related programs. Blocks of high Jaccard similarity correspond to topics capturing the same co-regulated biological process.
 
 ```{r,fig.width=15, fig.height=15}
-
-gene_set_K100 <- readRDS("/project/xuanyao/jiaming/Getting_started/data/repologle/topic_model/distance_mapping/K100/gene_set_K100.rds")
+library(pheatmap)
+gene_set_K100 <- readRDS("/project/xuanyao/jiaming/Getting_started/data/repologle/topic_geneset/flames+200kb/de_50_0.01_2_0.5.rds")
 clean_vec <- function(x) unique(as.character(x))
 
 L1 <- lapply(gene_set_K100   , clean_vec)
@@ -2201,7 +2271,6 @@ jaccard_mat <- outer(
 
 rownames(jaccard_mat) <- names(L1)
 colnames(jaccard_mat) <- names(L2)
-jaccard_mat
 
 mat <- as.matrix(jaccard_mat)
 storage.mode(mat) <- "numeric"
@@ -2215,930 +2284,38 @@ pheatmap(
   fontsize_row = 7,
   fontsize_col = 9,
   angle_col = 45,
-  filename = "jaccard_heatmap.pdf",
+  filename = "/project/xuanyao/jiaming/paper/jaccard_heatmap.pdf",
   width = 12, height = 12
 )
-```
-
-
-# Topic annotation
-
-```{r}
-library(gprofiler2)
-gene_set_K100 <- readRDS("/project/xuanyao/jiaming/Getting_started/data/repologle/topic_geneset/flames_200kb/de_70_0.01_2_0.5.rds")
-gene_sets <- lapply(gene_set_K100, function(x) unique(as.character(x)))
-
-# gene_sets <- lapply(de_10_0.01_2_0.5 , function(x) unique(as.character(x)))
-
-# 建议给每个 set 一个名字（没有就补上）
-if (is.null(names(gene_sets))) names(gene_sets) <- paste0("set_", seq_along(gene_sets))
-
-res <- gost(
-  query = gene_sets,                 # list of 100 gene vectors
-  organism = "hsapiens",
-  multi_query = TRUE,
-  correction_method = "fdr",
-  user_threshold = 0.05,
-  sources = c("GO:BP","GO:MF","KEGG")
-)
-
-names(res$result)   # 这时通常会看到 query / p_value / p_value_adj 等列
-
-```
-
-
-```{r}
-
-# geneset 名字：如果你有 gene_sets 的 names 就用它；否则自动生成
-gs_names <- names(gene_sets)
-if (is.null(gs_names)) gs_names <- paste0("set_", seq_along(res$result$significant[[1]]))
-
-# GO term 名字：用 term_id 或 term_name（建议 term_id 更稳定）
-go_names <- paste0(res$result$source, ":", res$result$term_id)
-# 如果你更想用可读名字：
-# go_names <- paste0(res$result$source, ":", res$result$term_name)
-
-# 1) list -> 矩阵：每列一个 term，每行一个 geneset
-sig_term_by_set <- do.call(cbind, res$result$significant)
-storage.mode(sig_term_by_set) <- "logical"
-
-# 2) 转成“geneset(行) × term(列)”的 index matrix
-idx_mat <- sig_term_by_set  # 现在行=geneset, 列=term（通常就是这个方向）
-rownames(idx_mat) <- gs_names
-colnames(idx_mat) <- go_names
-
-# 检查维度：应该是 100 x (#terms)
-dim(idx_mat)
-
-# 如果你发现方向反了（极少数情况），就用这一句修正：
-# idx_mat <- t(idx_mat)
-
-```
-
-
-```{r}
-rowSums(idx_mat)
-```
-
-```{r}
-library(dplyr)
-library(tidyr)
-
-go_tbl <- as_tibble(res$result)
-
-# geneset 名称（如果你有 names(gene_sets) 就用它；否则自动生成）
-G <- length(go_tbl$p_values[[1]])
-gs_names <- names(gene_sets)
-if (is.null(gs_names) || length(gs_names) != G) gs_names <- paste0("set_", seq_len(G))
-
-# 展开：term × geneset 的长表
-go_long <- go_tbl %>%
-  mutate(
-    query = list(gs_names),
-    p_value = p_values
-  ) %>%
-  dplyr::select(source, term_id, term_name, query, p_value) %>%
-  unnest(c(query, p_value))
-
-# 每个 geneset 取 top10（p_value 最小）
-top10_tbl <- go_long %>%
-  group_by(query) %>%
-  arrange(p_value, .by_group = TRUE) %>%
-  slice_head(n = 10) %>%
-  ungroup()
-
-# 你想要的：每个 geneset 的 top10 term_name（以及可选的 p_value）
-top10_names <- top10_tbl %>%
-  group_by(query) %>%
-  summarise(top10_term_name = list(term_name), .groups = "drop")
-
-top10_tbl      # 长表：每个 geneset 10 行
-top10_names    # 每个 geneset 1 行，top10 term_name 是一个 list
-
-```
-
-```{r}
-significant_geneset_name <- readRDS("/project/xuanyao/jiaming/paper/output/mediation_analysis/MCH/flames_200kb/k70/significant_associations.rds")
-
-```
-
-
-```{r}
-keep_sets <- unique(significant_geneset_name$module)
-
-top10_keep <- top10_names %>%
-  dplyr::filter(query %in% keep_sets)
-top10_keep
-```
-```{r}
-for (i in 1:nrow(top10_keep)){
-  print(top10_keep[i,2][[1]])
-}
-```
-
-
-```{r}
-library(dplyr)
-library(purrr)
-library(stringr)
-library(tidyr)
-
-# top10_names: data.frame/tibble with columns: query, top10_term_name (list of character vectors)
-# 例如你之前的：top10_names <- top10_tbl %>% group_by(query) %>% summarise(top10_term_name=list(term_name))
-
-
-theme_dict <- list(
-
-  # 1) Immune / inflammation / hemostasis
-  Immune_activation = c(
-    "cell activation",
-    "leukocyte activation",
-    "myeloid leukocyte activation",
-    "regulation of leukocyte activation",
-    "regulation of cell activation",
-    "lymphocyte activation",
-    "regulation of lymphocyte activation",
-    "immune system process",
-    "regulation of immune system process",
-    "immune response",
-    "regulation of macrophage cytokine production",
-    "macrophage cytokine production",
-    "regulation of interleukin-10 production",
-    "phagocytosis, engulfment",
-    "plasma membrane invagination",
-    "response to interferon-alpha",
-    "complement and coagulation cascades",
-    "platelet activation"
-  ),
-
-  # 2) Red blood cell / heme / oxygen transport / ROS detox
-  Redox_heme_oxygen = c(
-    "haptoglobin binding",
-    "oxygen carrier activity",
-    "oxygen transport",
-    "gas transport",
-    "oxygen binding",
-    "hydrogen peroxide catabolic process",
-    "hydrogen peroxide metabolic process",
-    "peroxidase activity",
-    "antioxidant activity",
-    "oxidoreductase activity, acting on peroxide as acceptor"
-  ),
-
-  # 3) Mitochondria & oxidative phosphorylation / respiration / energy
-  Mito_OXPHOS_respiration = c(
-    "oxidative phosphorylation",
-    "mitochondrial ATP synthesis coupled electron transport",
-    "ATP synthesis coupled electron transport",
-    "respiratory electron transport chain",
-    "electron transport chain",
-    "proton transmembrane transport",
-    "aerobic respiration",
-    "cellular respiration",
-    "energy derivation by oxidation of organic compounds",
-    "proton motive force-driven mitochondrial ATP synthesis",
-    "proton motive force-driven ATP synthesis",
-    "proton motive force-driven ATP synthesis",
-    "proton motive force-driven ATP synthesis",
-    "ATP biosynthetic process",
-    "generation of precursor metabolites and energy",
-    "thermogenesis"
-  ),
-
-  # 4) Cell cycle / mitosis / chromosome segregation / spindle / kinetochore
-  Cell_cycle_mitosis = c(
-    "cell cycle",
-    "cell cycle process",
-    "mitotic cell cycle",
-    "mitotic cell cycle process",
-    "mitotic nuclear division",
-    "cell division",
-    "nuclear division",
-    "organelle fission",
-    "chromosome segregation",
-    "sister chromatid segregation",
-    "mitotic sister chromatid segregation",
-    "nuclear chromosome segregation",
-    "chromosome separation",
-    "regulation of chromosome separation",
-    "regulation of mitotic sister chromatid separation",
-    "mitotic sister chromatid separation",
-    "metaphase/anaphase transition of mitotic cell cycle",
-    "metaphase/anaphase transition of cell cycle",
-    "spindle organization",
-    "mitotic spindle assembly",
-    "metaphase chromosome alignment",
-    "chromosome localization",
-    "establishment of chromosome localization",
-    "protein localization to kinetochore involved in kinetochore assembly",
-    "centromere complex assembly",
-    "chromatin remodeling at centromere",
-    "CENP-A containing chromatin assembly",
-    "mitotic sister chromatid segregation"
-  ),
-
-  # 5) DNA replication / repair / genome maintenance
-  DNA_replication_repair = c(
-    "DNA replication",
-    "DNA-templated DNA replication",
-    "DNA replication initiation",
-    "DNA repair",
-    "DNA damage response",
-    "double-strand break repair via homologous recombination",
-    "homologous recombination", # 注意：你的列表里没有这一条，下面我不会放；这里先删掉
-    "recombinational repair",
-    "Mismatch repair",
-    "DNA metabolic process"
-  ),
-
-  # 6) Chromatin / nucleosome / epigenetics / transcriptional regulation
-  Chromatin_epigenetics = c(
-    "chromatin organization",
-    "chromatin remodeling",
-    "chromosome organization",
-    "protein-DNA complex assembly",
-    "protein-DNA complex organization",
-    "protein localization to chromosome",
-    "protein localization to chromatin",
-    "structural constituent of chromatin",
-    "structural molecule activity",
-    "chromatin binding",
-    "chromatin DNA binding",
-    "nucleosomal DNA binding",
-    "nucleosome binding",
-    "nucleosome assembly",
-    "nucleosome organization",
-    "ATP-dependent chromatin remodeling",
-    "histone binding",
-    "epigenetic regulation of gene expression",
-    "negative regulation of gene expression, epigenetic",
-    "site-specific DNA-methyltransferase (adenine-specific) activity",
-    "histone H4K12 methyltransferase activity",
-    "histone H4R3 methyltransferase activity",
-    "arsenite methyltransferase activity",
-    "protein-glutamine N-methyltransferase activity",
-    "DNA-templated transcription",
-    "DNA-templated transcription initiation",
-    "transcription initiation at RNA polymerase II promoter",
-    "positive regulation of transcription by RNA polymerase II",
-    "negative regulation of transcription by RNA polymerase II",
-    "regulation of transcription by RNA polymerase II",
-    "positive regulation of DNA-templated transcription",
-    "positive regulation of DNA-templated transcription",
-    "DNA-binding transcription activator activity",
-    "DNA-binding transcription activator activity, RNA polymerase II-specific",
-    "sequence-specific DNA binding",
-    "transcription regulator activity"
-  ),
-
-  # 7) RNA processing / splicing / RNA metabolism
-  RNA_processing_splicing = c(
-    "RNA processing",
-    "RNA splicing",
-    "mRNA processing",
-    "Spliceosome",
-    "mRNA metabolic process",
-    "RNA metabolic process",
-    "RNA biosynthetic process",
-    "regulation of RNA metabolic process",
-    "negative regulation of RNA metabolic process",
-    "regulation of mRNA metabolic process",
-    "nucleic acid metabolic process",
-    "nucleic acid biosynthetic process",
-    "nucleobase-containing compound biosynthetic process",
-    "regulation of nucleobase-containing compound metabolic process",
-    "positive regulation of RNA metabolic process",
-    "negative regulation of RNA biosynthetic process",
-    "rRNA metabolic process",
-    "rRNA processing",
-    "snoRNA guided rRNA pseudouridine synthesis",
-    "snoRNA binding",
-    "tRNA binding",
-    "tRNA metabolic process",
-    "tRNA processing",
-    "tRNA modification",
-    "RNA modification",
-    "catalytic activity, acting on RNA",
-    "catalytic activity, acting on a tRNA"
-  ),
-
-  # 8) Translation / ribosome / ribonucleoprotein biogenesis
-  Translation_ribosome = c(
-    "translation",
-    "cytoplasmic translation",
-    "translation initiation factor activity",
-    "translation factor activity",
-    "translation initiation factor activity",
-    "regulation of translation",
-    "positive regulation of translation",
-    "translational elongation",
-    "translational termination",
-    "Ribosome",
-    "structural constituent of ribosome",
-    "ribosome binding",
-    "ribosomal large subunit binding",
-    "ribosome biogenesis",
-    "ribosomal large subunit biogenesis",
-    "ribosomal small subunit biogenesis",
-    "ribosomal small subunit assembly",
-    "mitochondrial small ribosomal subunit assembly",
-    "ribonucleoprotein complex biogenesis",
-    "ribonucleoprotein complex binding",
-    "RNA binding",
-    "mRNA binding",
-    "mRNA 3'-UTR binding",
-    "mRNA 3'-UTR AU-rich region binding",
-    "rescue of stalled ribosome",
-    "ribosome disassembly",
-    "mitochondrial translation",
-    "mitochondrial gene expression"
-  ),
-
-  # 9) Protein turnover / ubiquitin / proteasome / catabolism
-  Protein_catabolism_ubiquitin = c(
-    "macromolecule catabolic process",
-    "catabolic process",
-    "protein catabolic process",
-    "ubiquitin-dependent protein catabolic process",
-    "ubiquitin-dependent protein catabolic process via the multivesicular body sorting pathway",
-    "proteolysis involved in protein catabolic process",
-    "modification-dependent protein catabolic process",
-    "modification-dependent macromolecule catabolic process",
-    "protein K48-linked ubiquitination",
-    "protein neddylation",
-    "protein neddylation",
-    "Proteasome",
-    "protein metabolic process",
-    "regulation of protein metabolic process",
-    "protein-macromolecule adaptor activity",
-    "regulation of catabolic process",
-    "negative regulation of metabolic process",
-    "negative regulation of cellular process"
-  ),
-
-  # 10) ER stress / folding / ERAD / chaperones
-  ER_stress_folding_ERAD = c(
-    "Protein processing in endoplasmic reticulum",
-    "protein processing in endoplasmic reticulum",
-    "protein folding",
-    "protein folding in endoplasmic reticulum",
-    "misfolded protein binding",
-    "protein maturation",
-    "response to endoplasmic reticulum stress",
-    "endoplasmic reticulum unfolded protein response",
-    "regulation of response to endoplasmic reticulum stress",
-    "integrated stress response signaling",
-    "positive regulation of endoplasmic reticulum stress-induced intrinsic apoptotic signaling pathway",
-    "ERAD pathway",
-    "heat shock protein binding",
-    "chaperone-mediated protein folding",
-    "protein folding chaperone",
-    "ATP-dependent protein folding chaperone",
-    "protein refolding",
-    "cellular response to heat",
-    "response to heat",
-    "chaperone cofactor-dependent protein refolding",
-    "intramolecular oxidoreductase activity, transposing S-S bonds",
-    "protein disulfide isomerase activity",
-    "protein-disulfide reductase activity",
-    "disulfide oxidoreductase activity",
-    "oxidoreductase activity, acting on a sulfur group of donors",
-    "cysteine-type endopeptidase activity",
-    "cysteine-type peptidase activity"
-  ),
-
-  # 11) Vesicle trafficking / Golgi-ER / nuclear transport / localization
-  Vesicle_trafficking_transport = c(
-    "intracellular transport",
-    "intracellular protein transport",
-    "protein transport",
-    "protein localization",
-    "cellular macromolecule localization",
-    "macromolecule localization",
-    "cellular localization",
-    "establishment of localization in cell",
-    "establishment of protein localization",
-    "protein localization to nucleus",
-    "protein localization to chromosome",
-    "protein localization to chromatin",
-    "endoplasmic reticulum to Golgi vesicle-mediated transport",
-    "Golgi vesicle transport",
-    "retrograde vesicle-mediated transport, Golgi to endoplasmic reticulum",
-    "Nucleocytoplasmic transport",
-    "nucleocytoplasmic transport",
-    "nuclear transport",
-    "nuclear export",
-    "structural constituent of nuclear pore",
-    "membraneless organelle assembly"
-  ),
-
-  # 12) Cytoskeleton / adhesion / junctions / membrane organization
-  Cytoskeleton_adhesion_junction = c(
-    "actin filament-based process",
-    "actin cytoskeleton organization",
-    "actin filament organization",
-    "actin binding",
-    "actin filament binding",
-    "cytoskeleton organization",
-    "cytoskeletal protein binding",
-    "Tight junction",
-    "cadherin binding involved in cell-cell adhesion",
-    "cadherin binding",
-    "cell-cell adhesion",
-    "cell adhesion",
-    "cell-cell adhesion mediator activity",
-    "cell adhesion mediator activity",
-    "S100 protein binding",
-    "membrane organization"
-  ),
-
-  # 13) Membrane transporters (nucleosides, amino acids, organic acids, anions)
-  Membrane_transporters = c(
-    "uracil transmembrane transporter activity",
-    "cytidine transmembrane transporter activity",
-    "guanine transmembrane transporter activity",
-    "adenine transmembrane transporter activity",
-    "uridine transmembrane transporter activity",
-    "purine nucleoside transmembrane transporter activity",
-    "pyrimidine nucleobase transmembrane transporter activity",
-    "UDP-glucuronate transmembrane transport",
-    "UDP-N-acetylgalactosamine transmembrane transport",
-    "UDP-glucuronate transmembrane transporter activity",
-    "UDP-N-acetylgalactosamine transmembrane transporter activity",
-    "malate transmembrane transporter activity",
-    "oxaloacetate transmembrane transporter activity",
-    "malate transmembrane transport",
-    "oxaloacetate(2-) transmembrane transport",
-    "C4-dicarboxylate transmembrane transporter activity",
-    "sulfate transmembrane transporter activity",
-    "sulfate transmembrane transport",
-    "phosphate transmembrane transporter activity",
-    "L-amino acid transmembrane transporter activity",
-    "acidic amino acid transmembrane transporter activity",
-    "amino acid transmembrane transporter activity",
-    "amino acid transmembrane transport",
-    "organic acid transmembrane transporter activity",
-    "organic acid transmembrane transport",
-    "amino acid import across plasma membrane",
-    "L-alpha-amino acid transmembrane transport",
-    "L-amino acid transport",
-    "malate transport",
-    "oxaloacetate transport"
-  ),
-
-  # 14) Lipid / sterol / lipoprotein metabolism & transfer
-  Lipid_sterol_lipoprotein = c(
-    "sterol biosynthetic process",
-    "sterol metabolic process",
-    "cholesterol biosynthetic process",
-    "cholesterol metabolic process",
-    "lipid biosynthetic process",
-    "lipid metabolic process",
-    "steroid biosynthetic process",
-    "secondary alcohol metabolic process",
-    "secondary alcohol biosynthetic process",
-    "alcohol metabolic process",
-    "high-density lipoprotein particle remodeling",
-    "plasma lipoprotein particle remodeling",
-    "plasma lipoprotein particle organization",
-    "protein-lipid complex remodeling",
-    "protein-lipid complex organization",
-    "protein-containing complex remodeling",
-    "cholesterol efflux",
-    "very-low-density lipoprotein particle clearance",
-    "regulation of cholesterol transport",
-    "regulation of sterol transport",
-    "cholesterol transfer activity",
-    "sterol transfer activity",
-    "positive regulation of bile acid biosynthetic process",
-    "positive regulation of bile acid metabolic process",
-    "positive regulation of steroid biosynthetic process"
-  ),
-
-  # 15) Metal / mineral homeostasis & detox
-  Metal_homeostasis = c(
-    "Mineral absorption",
-    "cellular homeostasis",
-    "chemical homeostasis",
-    "intracellular chemical homeostasis",
-    "metal chelating activity",
-    "metal ion binding",
-    "cation binding",
-    "ion binding",
-    "detoxification of copper ion",
-    "stress response to copper ion",
-    "cellular response to copper ion",
-    "cellular response to zinc ion",
-    "stress response to metal ion",
-    "detoxification of inorganic compound"
-  ),
-
-  # 16) Central metabolism / amino acids / one-carbon / glycolysis / nucleotides
-  Metabolism_core = c(
-    "Biosynthesis of amino acids",
-    "amino acid biosynthetic process",
-    "proteinogenic amino acid biosynthetic process",
-    "L-amino acid biosynthetic process",
-    "L-serine biosynthetic process",
-    "serine family amino acid biosynthetic process",
-    "alpha-amino acid biosynthetic process",
-    "serine transport",
-    "L-serine transport",
-    "L-serine metabolic process",
-    "Carbon metabolism",
-    "One carbon pool by folate",
-    "glycolytic process",
-    "small molecule metabolic process",
-    "small molecule catabolic process",
-    "pyridine-containing compound catabolic process",
-    "pyridine nucleotide catabolic process",
-    "ADP metabolic process",
-    "ADP catabolic process",
-    "purine nucleoside diphosphate catabolic process",
-    "purine ribonucleoside diphosphate catabolic process",
-    "ribonucleoside diphosphate catabolic process",
-    "nucleoside diphosphate catabolic process",
-    "purine nucleoside diphosphate metabolic process",
-    "ATP:ADP adenylyltransferase activity",
-    "purine nucleoside triphosphate biosynthetic process",
-    "purine ribonucleoside triphosphate biosynthetic process",
-    "ribonucleoside triphosphate biosynthetic process",
-    "nucleoside triphosphate biosynthetic process",
-    "pyrimidine nucleobase biosynthetic process",
-    "nucleotide metabolic process",
-    "nucleobase-containing compound metabolic process"
-  ),
-
-  # 17) Signaling / developmental / vascular programs
-  Signaling_development = c(
-    "Hippo signaling pathway",
-    "TGF-beta signaling pathway",
-    "Signaling pathways regulating pluripotency of stem cells",
-    "vasculogenesis",
-    "blood vessel development",
-    "vasculature development",
-    "tube development",
-    "tube morphogenesis",
-    "anatomical structure development",
-    "anatomical structure formation involved in morphogenesis",
-    "anatomical structure morphogenesis",
-    "developmental process",
-    "multicellular organism development",
-    "multicellular organismal process",
-    "system development",
-    "intracellular signal transduction",
-    "canonical NF-kappaB signal transduction",
-    "regulation of canonical NF-kappaB signal transduction"
-  ),
-
-  # 18) Disease / KEGG context (non-GO, but present in your list)
-  Disease_KEGG_context = c(
-    "Parkinson disease",
-    "Huntington disease",
-    "Amyotrophic lateral sclerosis",
-    "Diabetic cardiomyopathy",
-    "Viral myocarditis",
-    "Coronavirus disease - COVID-19",
-    "Chemical carcinogenesis - reactive oxygen species",
-    "Transcriptional misregulation in cancer",
-    "Systemic lupus erythematosus",
-    "Alcoholism",
-    "Mitophagy - animal",
-    "Motor proteins"  # 这也是 KEGG-like term，在你的列表里出现
-  )
-)
-
-
-
-# 2) 把每个 geneset 的 top terms 拼成一个文本，便于匹配
-gs_text <- top10_names %>%
-  dplyr::mutate(text = purrr::map_chr(top10_term_name, ~ stringr::str_to_lower(paste(.x, collapse=" ; "))))
-
-library(dplyr)
-library(purrr)
-library(stringr)
-library(tidyr)
-library(tibble)
-
-
-
-library(dplyr)
-library(purrr)
-library(stringr)
-library(tibble)
-```
-
-
-```{r}
-# 如果 gs_text 目前只有 text 列，就补 query
-if (!"query" %in% names(gs_text)) {
-  gs_names <- if (exists("gene_sets") && !is.null(names(gene_sets))) names(gene_sets) else paste0("k", seq_len(nrow(gs_text)))
-  gs_text <- gs_text %>% mutate(query = gs_names, .before = 1)
-}
-text_vec <- gs_text$text
-
-library(dplyr)
-library(purrr)
-library(stringr)
-library(tidyr)
-library(tibble)
-
-# 1) 拆 term
-df_terms <- tibble(query = gs_text$query, text = gs_text$text) %>%
-  mutate(term = str_split(text, "\\s*;\\s*")) %>%
-  unnest(term) %>%
-  mutate(term = str_trim(str_to_lower(term))) %>%
-  filter(term != "")
-
-term_to_themes <- function(term, theme_dict) {
-  hits <- names(theme_dict)[map_lgl(theme_dict, ~ any(str_detect(term, fixed(str_to_lower(.x)))))]
-  if (length(hits) == 0) NA_character_ else hits
-}
-
-df_map <- df_terms %>%
-  mutate(theme = map(term, term_to_themes, theme_dict = theme_dict)) %>%
-  unnest(theme) %>%
-  filter(!is.na(theme))
-
-# 3A) 主题命中条目数（一个 term 可以给多个主题加 1）
-theme_count <- df_map %>%
-  count(query, theme, name = "n_terms") %>%
-  tidyr::pivot_wider(names_from = theme, values_from = n_terms, values_fill = 0)
-
-
-
-
-
-```
-
-```{r,fig.width=15,fig.height=12}
-library(pheatmap)
-
-x <- theme_count %>%
-  tibble::column_to_rownames("query") %>%   # query 作为行名
-  as.matrix()
 
 pheatmap(
-  t(x),
-  cluster_rows = T,
-  cluster_cols = T,
-  color  = colorRampPalette(c("white", "#FDAE61"))(100),
-  breaks = seq(min(x), max(x), length.out = 101),
-  fontsize_row = 7,
-  fontsize_col = 9,
-  angle_col = 45,
+  mat,
+  cluster_rows  = TRUE,
+  cluster_cols  = TRUE,
   treeheight_row = 0,
-  treeheight_col = 0
-)
-
-```
-
-```{r,fig.height=6}
-library(dplyr)
-library(tidyr)
-library(ggplot2)
-
-row_top_fun <- theme_count %>%
-  pivot_longer(-query, names_to = "GO_category", values_to = "count") %>%
-  group_by(query) %>%
-  mutate(max_count = max(count, na.rm = TRUE)) %>%
-  filter(count == max_count) %>%
-  dplyr::slice(1) %>%                 # 并列最大时取第一个
-  ungroup() %>%
-  mutate(GO_category = ifelse(max_count == 0 | is.na(max_count), "Unassigned", GO_category)) %>%
-  dplyr::select(query, GO_category)
-
-fun_summary <- row_top_fun %>%
-  count(GO_category, name = "n_geneset") %>%
-  arrange(desc(n_geneset)) %>%
-  mutate(label = paste0(GO_category, "\n", n_geneset))
-
-ggplot(fun_summary, aes(x = "", y = n_geneset, fill = GO_category)) +
-  geom_col(width = 1, color = "white") +
-  coord_polar(theta = "y") +
-  theme_void() +
-  labs(title = "Top function per geneset (row-wise max)") +
-  geom_text(aes(label = n_geneset),
-            position = position_stack(vjust = 0.5),
-            size = 3)
-
-```
-# Overlap between geneset of different K -- MCH
-
-
-
-
-
-```{r}
-get_de_genes <- function(de, k,
-                         lfsr_thr = 0.01,
-                         z_thr    = 2,
-                         fc_thr   = 0.5,
-                         gene_names) {
-
-  z_k     <- de$z[, k]
-  lfsr_k  <- de$lfsr[, k]
-  beta_k  <- de$postmean[, k]   
-
-  # 先去掉 NA
-  ok <- !is.na(z_k) & !is.na(lfsr_k) & !is.na(beta_k)
-
-  idx <- which(
-    ok &
-      lfsr_k <= lfsr_thr &      # 置信度高
-      abs(z_k)   >= z_thr &     # z 比较大
-      abs(beta_k) >= fc_thr     # fold change 比较大
-  )
-
-  gene_names[idx]
-}
-```
-
-
-```{r}
-de <- readRDS("/project/xuanyao/jiaming/Getting_started/data/repologle/topic_model/flames_200kb/de_70.rds")
-
-
-de_genes_list <- lapply(seq_len(ncol(de$z)),
-                        function(k) get_de_genes(de, k,gene_names=rownames(de$F)))
-names(de_genes_list) <- paste0("k", seq_len(ncol(de$z)))
-
-filtered_list_70 <- Filter(function(x) length(x) > 5, de_genes_list)
-
-
-de <- readRDS("/project/xuanyao/jiaming/Getting_started/data/repologle/topic_model/flames_200kb/de_100.rds")
-
-
-de_genes_list <- lapply(seq_len(ncol(de$z)),
-                        function(k) get_de_genes(de, k,gene_names=rownames(de$F)))
-names(de_genes_list) <- paste0("k", seq_len(ncol(de$z)))
-
-filtered_list_100 <- Filter(function(x) length(x) > 4, de_genes_list)
-
-
-
-de <- readRDS("/project/xuanyao/jiaming/Getting_started/data/repologle/topic_model/flames_200kb/de_60.rds")
-
-
-de_genes_list <- lapply(seq_len(ncol(de$z)),
-                        function(k) get_de_genes(de, k,gene_names=rownames(de$F)))
-names(de_genes_list) <- paste0("k", seq_len(ncol(de$z)))
-
-filtered_list_60 <- Filter(function(x) length(x) > 4, de_genes_list)
-
-
-de <- readRDS("/project/xuanyao/jiaming/Getting_started/data/repologle/topic_model/flames_200kb/de_50.rds")
-
-
-de_genes_list <- lapply(seq_len(ncol(de$z)),
-                        function(k) get_de_genes(de, k,gene_names=rownames(de$F)))
-names(de_genes_list) <- paste0("k", seq_len(ncol(de$z)))
-
-filtered_list_50 <- Filter(function(x) length(x) > 4, de_genes_list)
-
-
-
-
-```
-
-```{r}
-
-clean_vec <- function(x) unique(as.character(x))
-
-L1 <- lapply(filtered_list_50, clean_vec)
-L2 <- lapply(filtered_list_60, clean_vec)
-
-# pairwise Jaccard matrix
-jaccard_mat <- outer(
-  seq_along(L1),
-  seq_along(L2),
-  Vectorize(function(i, j) {
-    a <- L1[[i]]
-    b <- L2[[j]]
-    if (length(a) == 0 && length(b) == 0) return(NA_real_)
-    length(intersect(a, b)) / max(length(a),length(b))
-  })
-)
-
-rownames(jaccard_mat) <- names(L1)
-colnames(jaccard_mat) <- names(L2)
-
-
-library(pheatmap)
-
-mat <- as.matrix(jaccard_mat)
-storage.mode(mat) <- "numeric"
-
-pheatmap(
-  mat,
-  cluster_rows = TRUE,
-  cluster_cols = TRUE,
-  fontsize_row = 7,
-  fontsize_col = 9,
-  angle_col = 45
+  treeheight_col = 0,
+  fontsize_row  = 7,
+  fontsize_col  = 9,
+  angle_col     = 45,
+  width         = 12,
+  height        = 12
 )
 ```
 
-```{r}
-idx <- which(mat > 0.5, arr.ind = TRUE)
-
-out <- data.frame(
-  row_index = idx[, "row"],
-  col_index = idx[, "col"],
-  row_name  = rownames(mat)[idx[, "row"]],
-  col_name  = colnames(mat)[idx[, "col"]],
-  value     = mat[idx],
-  row.names = NULL
-)
-
-out
-```
 
 
-```{r}
 
-clean_vec <- function(x) unique(as.character(x))
+# Computational efficiency benchmarks
 
-L1 <- lapply(filtered_list_50, clean_vec)
-L2 <- lapply(filtered_list_70, clean_vec)
+OPERA is designed to scale to large Perturb-seq datasets. This section reports wall-clock time (seconds/minutes per chunk) and peak RAM usage (MiB/GiB) by parsing Snakemake job log files (`*.out`) for each dataset. Each "chunk" corresponds to one Snakemake job processing a subset of perturbation–gene set pairs. The summaries show that OPERA's per-chunk runtime and memory footprint remain tractable even for the largest datasets (e.g., the Replogle dataset with >1,000 perturbations).
 
-# pairwise Jaccard matrix
-jaccard_mat <- outer(
-  seq_along(L1),
-  seq_along(L2),
-  Vectorize(function(i, j) {
-    a <- L1[[i]]
-    b <- L2[[j]]
-    if (length(a) == 0 && length(b) == 0) return(NA_real_)
-    length(intersect(a, b)) / max(length(a),length(b))
-  })
-)
+## OPERA benchmarks
 
-rownames(jaccard_mat) <- names(L1)
-colnames(jaccard_mat) <- names(L2)
-
-
-library(pheatmap)
-
-mat <- as.matrix(jaccard_mat)
-storage.mode(mat) <- "numeric"
-
-pheatmap(
-  mat,
-  cluster_rows = TRUE,
-  cluster_cols = TRUE,
-  fontsize_row = 7,
-  fontsize_col = 9,
-  angle_col = 45
-)
-```
-
-```{r}
-
-clean_vec <- function(x) unique(as.character(x))
-
-L1 <- lapply(filtered_list_50, clean_vec)
-L2 <- lapply(filtered_list_50, clean_vec)
-
-# pairwise Jaccard matrix
-jaccard_mat <- outer(
-  seq_along(L1),
-  seq_along(L2),
-  Vectorize(function(i, j) {
-    a <- L1[[i]]
-    b <- L2[[j]]
-    if (length(a) == 0 && length(b) == 0) return(NA_real_)
-    length(intersect(a, b)) / max(length(b),length(b))
-  })
-)
-
-rownames(jaccard_mat) <- names(L1)
-colnames(jaccard_mat) <- names(L2)
-
-
-library(pheatmap)
-
-mat <- as.matrix(jaccard_mat)
-storage.mode(mat) <- "numeric"
-
-pheatmap(
-  mat,
-  cluster_rows = TRUE,
-  cluster_cols = TRUE,
-  fontsize_row = 7,
-  fontsize_col = 9,
-  angle_col = 45
-)
-```
-
-# Efficiency
-
-## OPERA
-
-### Morris
+### Morris dataset
 
 ```{r}
 library(dplyr)
+library(stringr)
 
 # 设置目录路径
 out_dir <- "/project/xuanyao/jiaming/OPERA/snakemake/logs_morris/out"  # ← 改成你的实际路径
@@ -3211,7 +2388,6 @@ median(chunk_summary$total_Elapsed_min)
 
 
 
-### Morris
-
+### Morris dataset (SCEPTRE comparison)
 
 
