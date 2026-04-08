@@ -2302,6 +2302,20 @@ pheatmap(
 )
 ```
 
+```{r,fig.width=15, fig.height=15}
+pheatmap(
+  mat,
+  cluster_rows  = TRUE,
+  cluster_cols  = TRUE,
+  treeheight_row = 0,
+  treeheight_col = 0,
+  fontsize_row  = 7,
+  fontsize_col  = 9,
+  angle_col     = 45,
+  width         = 12,
+  height        = 12
+)
+```
 
 
 
