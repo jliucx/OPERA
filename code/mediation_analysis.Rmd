@@ -41,7 +41,7 @@ Gene-level GWAS burden-test p-values for the trait are aggregated within each ge
 
 - **Cis-gene exclusion:** For each perturbation, genes that are cis-regulated by the perturbed locus (from `discovery_pairs_cis`) are removed from the corresponding topic modules before computing geneset–trait p-values. This prevents circular evidence where the perturbed gene's own cis-effects inflate the geneset–trait signal.
 - **Negative control:** 514 non-targeting perturbations from the Replogle dataset serve as negative controls. Under a 5% FDR threshold, only 0.07% of negative-control pairs are called significant, demonstrating excellent calibration.
-- **Comparison with Ota et al.:** Of 13 Ota (peripheral gene - downstream regulated pathway) pairs present in our test set, 11 are identified as significant by OPERA. confirming biological concordance.
+- **Comparison with Ota et al.:** Of 16 Ota (peripheral gene - downstream regulated pathway) pairs present in our test set, 11 are identified as significant by OPERA. confirming biological concordance.
 
 ## Utility functions and libraries
 
@@ -1001,10 +1001,12 @@ sig_GO[,c(1,3,4)]
 To assess concordance with prior work, we compare our significant gene-set members to the three major biological axes reported by Ota et al. for MCH: hemoglobin synthesis, cell cycle, and autophagy.
 
 The chunks below define the gene lists for each Ota et al. axis and check overlap with:
-1. Our peripheral gene test set (1,297 perturbations) — how many Ota genes do we test?
-2. Genes in our significant mediating modules — do the right genes fall in the right categories?
+Peripheral genes in our significant mediating modules — do the genes have the same regulatory effect as Ota?
 
-Of 13 Ota (peripheral gene - downstream regulated pathway) pair present in our test set, 11 are identified as significant by OPERA. At the gene-set level, cell-cycle module genes include G2E3, CCNF, CCNA2, H4C3, CLSPN, ATAD2, and BRIP1; hemoglobin module genes include HBA1, HBD, KLF1, SLC25A37, and EPOR.
+Of 16 Ota (peripheral gene - downstream regulated pathway) pair present in our test set, 11 (68.75%) are identified as significant by OPERA. At the gene-set level, cell-cycle module genes include G2E3, CCNF, CCNA2, H4C3, CLSPN, ATAD2, and BRIP1; hemoglobin module genes include HBA1, HBD, KLF1, SLC25A37, and EPOR.
+
+
+**Below are the peripheral genes from Ota, catogorized by pathways they regulate**
 
 ```{r,echo=T}
 haemoglobin_genes <-c(
@@ -1026,6 +1028,7 @@ autophagy_genes <- c(
 )
 
 ```
+
 ```{r}
 gene_names_clean <- sub("\\s*\\(.*\\)$", "", merged_df$merged_gene_name)
 
@@ -1045,6 +1048,7 @@ ensg_ids <- sub("^gRNA:", "", Repologle_associated_perturbations)
 symbol_vector <- ensg_to_symbol[ensg_ids]
 ```
 
+**We next check how many of them can be tested (i.e. in our peripheral gene list), and how many of them pass the significance level**
 
 ```{r}
 for (cat_name in c("Haemoglobin", "Cell_cycle", "Autophagy")) {
@@ -1061,10 +1065,10 @@ for (cat_name in c("Haemoglobin", "Cell_cycle", "Autophagy")) {
   cat("Category:", cat_name, "\n")
   cat("Total genes in Ota:", length(genes), "\n\n")
   
-  cat("  In test set (symbol_vector) —", length(in_test), "genes:\n")
+  cat("  In our test set —", length(in_test), "genes:\n")
   cat(" ", paste(sort(in_test), collapse = ", "), "\n\n")
   
-  cat("  In significant set (gene_vector) —", length(in_sig), "genes:\n")
+  cat("  Pass our test —", length(in_sig), "genes:\n")
   cat(" ", paste(sort(in_sig), collapse = ", "), "\n\n")
 }
 ```
@@ -1081,7 +1085,7 @@ autophagy_module_genes <- c(gene_modules_id$k44,gene_modules_id$k7)
 haemoglobin_module_genes <- c(gene_modules_id$k2,gene_modules_id$k4)
 ```
 
-```{r,echo=T}
+```{r,include=F}
 to_symbol <- function(ensg_vec) {
   ensg_ids <- sub("^gRNA:", "", ensg_vec)
   symbols <- ensg_to_symbol[ensg_ids]
@@ -1126,7 +1130,9 @@ intersect(cell_cycle_module_symbols,cell_cycle_module_genes_ota)
 intersect(hemoglobin_module_genes_ota,haemoglobin_module_symbols)
 ```
 
-**Below comparing the functional regulation of shared peripheral genes between OPERA and Ota**
+**Then we consider whether the significant peripheral genes have the same regulating effect as indicated by Ota. Below comparing the functional regulation of shared peripheral genes between OPERA and Ota**
+
+For example, CAD, in our model, are significantly associated with Autophagy, Cell Cycle, and Haemoglobin pathway, while in Ota are only associated with Haemoglobin. Then we treat CAD-Haemoglobin as a successfully replicated pair. We have replicated 11 out of 16 pairs from Ota.
 
 ```{r}
 # ── Step 1: 获取有分类的模块列表 ──────────────────────────────────────────────
@@ -1193,8 +1199,7 @@ result_with_func <- gene_module_func %>%
   mutate(gene_category = sapply(gene, get_gene_function))
 
 # ── Step 7: 输出 ─────────────────────────────────────────────────────────────
-cat("有 function match 的基因数:", nrow(result_with_func), "\n")
-cat("总 gene-module match 数:",   nrow(gene_module_df),   "\n\n")
+
 
 colnames(result_with_func)[5:6]<-c("OPERA_downstream_function","Ota_downstream_function")
 print(result_with_func, n = Inf)
@@ -1442,13 +1447,17 @@ plot_gene_module_network_MCH <- function(df12,
   igraph::E(g)$width <- ifelse(edge_bold, pmax(base_w * 2, 3), base_w)
 
   # ── 标签 ─────────────────────────────────────────────────────────────────────
-  igraph::V(g)$label     <- NA_character_
-  igraph::V(g)$label.cex <- ifelse(igraph::V(g)$type == "module", 0.9, 0.7)
+  igraph::V(g)$label      <- NA_character_
+  igraph::V(g)$label.cex  <- ifelse(igraph::V(g)$type == "module", 0.9, 0.7)
+  igraph::V(g)$label.color <- "black"
   if (label_modules) {
     for (idx in mod_ids)  igraph::V(g)$label[idx] <- igraph::V(g)$name[idx]
   }
   if (label_genes) {
-    for (idx in gene_ids) igraph::V(g)$label[idx] <- igraph::V(g)$name[idx]
+    for (idx in gene_ids) {
+      if (length(get_gene_categories(igraph::V(g)$name[idx])) > 0)
+        igraph::V(g)$label[idx] <- igraph::V(g)$name[idx]
+    }
   }
 
   # ── 绘图 ─────────────────────────────────────────────────────────────────────
@@ -1594,11 +1603,11 @@ plot_module_ego_MCH <- function(focal_module,
                                  cell_cycle_genes,
                                  autophagy_genes,
                                  unclassified_alpha = 0.3,
-                                 gene_size      = 8,
+                                 gene_size      = 10,
                                  focal_size     = 30,
-                                 other_mod_size = 20,
+                                 other_mod_size = 22,
                                  label_genes    = TRUE,
-                                 label_cex      = 0.55) {
+                                 label_cex      = 0.75) {
 
   # ── colour helpers (identical to plot_gene_module_network_MCH) ───────────────
   mix_hex_colors <- function(hex_vec) {
@@ -1677,17 +1686,20 @@ plot_module_ego_MCH <- function(focal_module,
     dplyr::distinct()
 
   # ── vertices ──────────────────────────────────────────────────────────────────
-  focal_v <- data.frame(name     = focal_module,
-                         vtype    = "focal_module",
-                         gene_raw = NA_character_,
+  focal_v <- data.frame(name      = focal_module,
+                         vtype     = "focal_module",
+                         gene_raw  = NA_character_,
+                         gene_loci = NA_character_,
                          stringsAsFactors = FALSE)
 
   gene_v <- focal_rows %>%
-    dplyr::transmute(name = summary, vtype = "gene", gene_raw = merged_gene_name)
+    dplyr::transmute(name = summary, vtype = "gene",
+                     gene_raw = merged_gene_name, gene_loci = merged_loci)
 
   other_v <- other_mod_rows %>%
     dplyr::distinct(module) %>%
-    dplyr::transmute(name = module, vtype = "other_module", gene_raw = NA_character_)
+    dplyr::transmute(name = module, vtype = "other_module",
+                     gene_raw = NA_character_, gene_loci = NA_character_)
 
   verts <- dplyr::bind_rows(focal_v, gene_v, other_v)
 
@@ -1712,7 +1724,7 @@ plot_module_ego_MCH <- function(focal_module,
   is_module_node <- igraph::V(g)$vtype %in% c("focal_module", "other_module")
   igraph::V(g)$shape       <- ifelse(is_module_node, "square", "circle")
   igraph::V(g)$frame.color <- NA
-  igraph::V(g)$label.color <- "white"
+  igraph::V(g)$label.color <- "black"
 
   igraph::V(g)$color <- vapply(seq_len(igraph::vcount(g)), function(i) {
     if (igraph::V(g)$vtype[i] == "gene")
@@ -1725,13 +1737,36 @@ plot_module_ego_MCH <- function(focal_module,
                                ifelse(igraph::V(g)$vtype == "other_module", other_mod_size,
                                       gene_size))
 
-  igraph::V(g)$label <- ifelse(
-    igraph::V(g)$vtype == "gene",
-    ifelse(label_genes, igraph::V(g)$gene_raw, NA_character_),
-    igraph::V(g)$name
-  )
-  igraph::V(g)$label.cex <- ifelse(igraph::V(g)$vtype == "focal_module", 1.1,
-                                    ifelse(igraph::V(g)$vtype == "other_module", 0.9,
+  # module label helper: "kX\nfunction summary"
+  get_module_label <- function(mod_name) {
+    if (is.null(sig_GO)) return(mod_name)
+    rows <- sig_GO[sig_GO$module == mod_name, , drop = FALSE]
+    if (nrow(rows) == 0 || all(is.na(rows$summary))) return(mod_name)
+    fn <- rows$summary[1]
+    # wrap long summaries at 30 chars
+    fn_wrapped <- paste(strwrap(fn, width = 30), collapse = "\n")
+    paste0(mod_name, "\n", fn_wrapped)
+  }
+
+  igraph::V(g)$label <- vapply(seq_len(igraph::vcount(g)), function(i) {
+    vt  <- igraph::V(g)$vtype[i]
+    nm  <- igraph::V(g)$name[i]
+    raw <- igraph::V(g)$gene_raw[i]
+    loc <- igraph::V(g)$gene_loci[i]
+    if (vt == "focal_module") {
+      get_module_label(nm)
+    } else if (vt == "other_module") {
+      NA_character_
+    } else {
+      # gene: only label if it has a biological category (colored)
+      if (!label_genes || length(get_gene_categories(raw)) == 0)
+        NA_character_
+      else
+        raw
+    }
+  }, character(1))
+  igraph::V(g)$label.cex <- ifelse(igraph::V(g)$vtype == "focal_module", 0.85,
+                                    ifelse(igraph::V(g)$vtype == "other_module", 0.7,
                                            label_cex))
 
   # ── edge colours (same logic as plot_gene_module_network_MCH) ────────────────
@@ -1769,8 +1804,27 @@ plot_module_ego_MCH <- function(focal_module,
 
   if (n_genes > 0) {
     th <- seq(0, 2 * pi, length.out = n_genes + 1)[seq_len(n_genes)]
-    lay[gene_idx, 1] <- cos(th)
-    lay[gene_idx, 2] <- sin(th)
+
+    # spread colored genes evenly; fill gaps with uncolored
+    is_colored <- vapply(igraph::V(g)$gene_raw[gene_idx],
+                         function(r) length(get_gene_categories(r)) > 0,
+                         logical(1))
+    colored_pos   <- which(is_colored)
+    uncolored_pos <- which(!is_colored)
+    n_colored     <- length(colored_pos)
+
+    if (n_colored > 0 && n_colored < n_genes) {
+      colored_slots <- round(seq(1, n_genes, length.out = n_colored))
+      new_order                          <- integer(n_genes)
+      new_order[colored_slots]           <- colored_pos
+      new_order[setdiff(seq_len(n_genes), colored_slots)] <- uncolored_pos
+      gene_idx_ord <- gene_idx[new_order]
+    } else {
+      gene_idx_ord <- gene_idx
+    }
+
+    lay[gene_idx_ord, 1] <- cos(th)
+    lay[gene_idx_ord, 2] <- sin(th)
   }
 
   if (n_others > 0) {
@@ -1794,10 +1848,53 @@ plot_module_ego_MCH <- function(focal_module,
     }
   }
 
+  # build title: module ID + biological function if available
+  focal_fn <- if (!is.null(sig_GO)) {
+    rows <- sig_GO[sig_GO$module == focal_module, , drop = FALSE]
+    if (nrow(rows) > 0 && !is.na(rows$summary[1])) rows$summary[1] else ""
+  } else ""
+  main_title <- if (nchar(focal_fn) > 0)
+    paste0("Module ", focal_module, " — ", focal_fn)
+  else
+    paste0("Module ", focal_module)
+
+  # ── per-node label placement: gene labels point outward to reduce overlap ─────
+  n_v          <- igraph::vcount(g)
+  lbl_dist     <- rep(0.5, n_v)
+  lbl_degree   <- rep(-pi / 2, n_v)   # default: above node
+
+  for (i in seq_len(n_v)) {
+    if (igraph::V(g)$vtype[i] == "gene") {
+      angle            <- atan2(lay[i, 2], lay[i, 1])
+      lbl_degree[i]    <- angle          # label radiates outward from centre
+      lbl_dist[i]      <- 1.5
+    }
+  }
+
+  igraph::V(g)$label.dist   <- lbl_dist
+  igraph::V(g)$label.degree <- lbl_degree
+
   plot(g, layout = lay,
-       main = paste("Ego network — module:", focal_module),
-       vertex.label.dist = 0.5,
+       main        = main_title,
        edge.curved = 0.2)
+
+  # ── legend ────────────────────────────────────────────────────────────────────
+  legend(
+    "bottomright",
+    legend = c("Haemoglobin / erythroid",
+               "Cell cycle",
+               "Autophagy",
+               "Unclassified"),
+    pt.bg  = c(col_haem, col_cycle, col_auto,
+               add_alpha(default_gene_col, unclassified_alpha)),
+    col    = "black",
+    pch    = 21,
+    pt.cex = 1.6,
+    bty    = "n",
+    cex    = 0.8,
+    title  = expression(bold("Biological category"))
+  )
+
   invisible(g)
 }
 
@@ -4155,6 +4252,115 @@ plot_gene_module_network2(
 
 # Asthma_CDT4
 
+## GO enrichment
+
+```{r}
+library(gprofiler2)
+ gene_modules_id <- readRDS("/project/xuanyao/jiaming/Getting_started/data/CDT4/topic_geneset/flames+200kb/de_50_0.01_2_0.5.rds")
+
+ de_10_0.01_2_0.5 <-gene_modules_id
+
+gene_sets <- lapply(de_10_0.01_2_0.5, function(x) unique(as.character(x)))
+
+# gene_sets <- lapply(de_10_0.01_2_0.5 , function(x) unique(as.character(x)))
+
+# 建议给每个 set 一个名字（没有就补上）
+if (is.null(names(gene_sets))) names(gene_sets) <- paste0("set_", seq_along(gene_sets))
+
+res <- gost(
+  query = gene_sets,                 # list of 100 gene vectors
+  organism = "hsapiens",
+  multi_query = TRUE,
+  correction_method = "fdr",
+  user_threshold = 0.05,
+  sources = c("GO:BP","GO:MF","KEGG")
+)
+
+
+
+# geneset 名字：如果你有 gene_sets 的 names 就用它；否则自动生成
+gs_names <- names(gene_sets)
+if (is.null(gs_names)) gs_names <- paste0("set_", seq_along(res$result$significant[[1]]))
+
+# GO term 名字：用 term_id 或 term_name（建议 term_id 更稳定）
+go_names <- paste0(res$result$source, ":", res$result$term_id)
+# 如果你更想用可读名字：
+# go_names <- paste0(res$result$source, ":", res$result$term_name)
+
+# 1) list -> 矩阵：每列一个 term，每行一个 geneset
+sig_term_by_set <- do.call(cbind, res$result$significant)
+storage.mode(sig_term_by_set) <- "logical"
+
+# 2) 转成“geneset(行) × term(列)”的 index matrix
+idx_mat <- sig_term_by_set  # 现在行=geneset, 列=term（通常就是这个方向）
+rownames(idx_mat) <- gs_names
+colnames(idx_mat) <- go_names
+
+
+# 如果你发现方向反了（极少数情况），就用这一句修正：
+# idx_mat <- t(idx_mat)
+
+library(dplyr)
+library(tidyr)
+
+go_tbl <- as_tibble(res$result)
+
+# geneset 名称（如果你有 names(gene_sets) 就用它；否则自动生成）
+G <- length(go_tbl$p_values[[1]])
+gs_names <- names(gene_sets)
+if (is.null(gs_names) || length(gs_names) != G) gs_names <- paste0("set_", seq_len(G))
+
+# 展开：term × geneset 的长表
+go_long <- go_tbl %>%
+  mutate(
+    query   = list(gs_names),
+    p_value = p_values,
+    sig     = significant       # significant 列也是 list，记录每个 geneset 是否显著
+  ) %>%
+  dplyr::select(source, term_id, term_name, query, p_value, sig) %>%
+  unnest(c(query, p_value, sig)) %>%
+  filter(sig == TRUE)  
+
+# 每个 geneset 取 top10（p_value 最小）
+top10_tbl <- go_long %>%
+  group_by(query) %>%
+  arrange(p_value, .by_group = TRUE) %>%
+  ungroup()
+
+# 你想要的：每个 geneset 的 top10 term_name（以及可选的 p_value）
+top10_names <- top10_tbl %>%
+  group_by(query) %>%
+  summarise(top10_term_name = list(term_name), .groups = "drop")
+
+
+
+# 注意！！！！！！！！！！！！！！！是按 1， 10 ，11 等排序
+```
+
+```{r,eval=F}
+library(openxlsx)
+wb <- createWorkbook()
+for (q in sort(unique(top10_tbl$query))) {
+  df_sheet <- top10_tbl %>%
+    filter(query == q) %>%
+    dplyr::select(term_name, p_value) %>%
+    as.data.frame()
+  addWorksheet(wb, q)
+  writeData(wb, q, df_sheet)
+}
+saveWorkbook(wb, "/project/xuanyao/jiaming/paper/GO_terms_pvalue_athma_CD4_k50.xlsx", overwrite = TRUE)
+```
+
+```{r,eval=F}
+## K20
+top10_names[11,2][[1]]
+```
+```{r,eval=F}
+top10_names[37,2][[1]]
+```
+
+## Geneset–trait associations and AdaFilter mediation test (Asthma, K50, flames+200kb)
+
 ```{r}
 library(data.table)
 library(dplyr)
@@ -4175,9 +4381,7 @@ Nadig_associated_perturbation <- readRDS("/project/xuanyao/jiaming/Getting_start
 discovery_pairs_cis <- readRDS("/project/xuanyao/jiaming/Getting_started/data/CDT4/standard_input_format_asthma/flames+200kb/discovery_pairs_cis.rds")
 
 
- # gene_modules_id <- readRDS("/project/xuanyao/jiaming/Getting_started/data/Nadig/topic_geneset/flames+200kb/de_20_0.01_2_0.5.rds")
- 
- gene_modules_id<-filtered_list_2
+ gene_modules_id <- readRDS("/project/xuanyao/jiaming/Getting_started/data/CDT4/topic_geneset/flames+200kb/de_50_0.01_2_0.5.rds")
 
 
 
@@ -4185,7 +4389,7 @@ discovery_pairs_cis <- readRDS("/project/xuanyao/jiaming/Getting_started/data/CD
 # -----------------------------
 # 1) Build pv_map from df2
 # -----------------------------
-gene_id <- str_extract(df2$Name, "^[^(]+(?=\\()")
+gene_id <- str_extract(df2$Name, "^[^(]+")
 
 lookup <- df2 %>%
   mutate(ID = gene_id) %>%
@@ -4304,8 +4508,106 @@ module_results <- map_dfr(Nadig_associated_perturbation, compute_for_one_pert)
 # 查看结果
 module_results %>%
   arrange(p_fisher) %>%
-  print(n = 30)
+  print(n = 10)
 
 ```
 
+
+```{r}
+library(tidyr)
+library(dplyr)
+library(tibble)
+
+snp_geneset_p_value<-  readRDS("/project/xuanyao/jiaming/paper/output/snake/CDT4_asthma/flames_200kb/K50/3000_t_ACAT_resample/p_values/geneset_p_value.rds")
+snp_geneset_p_value_test <- snp_geneset_p_value[which(!grepl("NTC-",rownames(snp_geneset_p_value))),]
+snp_geneset_p_value_control <- snp_geneset_p_value[which(grepl("NTC-",rownames(snp_geneset_p_value))),]
+
+df1_long <- snp_geneset_p_value_test %>%
+  as.data.frame() %>%
+  rownames_to_column("snp") %>%      # 这里真正把 rownames 变成一列 snp
+  pivot_longer(
+    -snp,
+    names_to  = "module",
+    values_to = "p_snp_geneset"
+  )
+
+## 2. 模块层面的表，只保留需要的列
+df2 <- module_results %>%
+  dplyr::select(module, p_fisher,snp)
+
+## 3. 按 module 合并，再调整列顺序
+merged <- df1_long %>%
+  left_join(df2, by = c("snp", "module")) %>%  # 关键改动
+  relocate(snp, module, p_snp_geneset, p_fisher)%>% tidyr::drop_na()
+
+
+# library(dplyr)
+# 
+# df1 <- as.data.frame(snp_geneset_p_value)
+# df1$snp <- rownames(df1)
+# 
+# df1_long <- df1 %>%
+#   pivot_longer(-snp, names_to = "module", values_to = "p_snp_geneset")
+# 
+# ## 图二：geneset_acat_pvals_M1.0001（列：module, p_acat）
+# df2 <- geneset_acat_pvals_M1.0001 %>%
+#   dplyr::select(module, p_fisher)
+# 
+# merged <- df1_long %>%
+#   left_join(df2, by = "module") %>%
+#   relocate(snp, module, p_snp_geneset, p_fisher)
+# 
+# 
+
+library(adaFilter)
+
+module_sizes <- lengths(gene_modules_id)
+merged <- merged %>% filter(module_sizes[module] > 1)
+
+X <- merged[,c(3,4)]
+result <- adaFilter(X, r = 2,alpha=0.13)
+
+merged$decision <- result$decision
+colnames(merged)[c(3,4)] <- c("snp_geneset","geneset_trait")
+
+merged[merged$decision==1,]
+```
+```{r}
+merged %>% arrange(geneset_trait + snp_geneset) %>% head()
+```
+
+
+
+### modules most related to asthma
+
+```{r}
+target_modules <- c("k9", "k20", "k24", "k25", "k28", "k32", "k35")
+
+merged_sub <- merged %>% filter(module %in% target_modules)
+
+X_sub <- merged_sub[, c("snp_geneset", "geneset_trait")]
+result_sub <- adaFilter(X_sub, r = 2, alpha = 0.1)
+
+merged_sub$decision <- result_sub$decision
+
+merged_sub[merged_sub$decision == 1, ]
+```
+
+### modules related to immune
+
+```{r}
+target_modules <- c(  "k5", "k7", "k8", "k9", "k10", "k12", "k13",
+  "k20", "k21", "k24", "k25", "k26", "k28",
+  "k32", "k33", "k34", "k35", "k40", "k42",
+  "k46", "k47")
+
+merged_sub <- merged %>% filter(module %in% target_modules)
+
+X_sub <- merged_sub[, c("snp_geneset", "geneset_trait")]
+result_sub <- adaFilter(X_sub, r = 2, alpha = 0.1)
+
+merged_sub$decision <- result_sub$decision
+
+merged_sub[merged_sub$decision == 1, ]
+```
 
