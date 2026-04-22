@@ -514,7 +514,7 @@ get_de_genes <- function(de, k,
 
 
 
-de <-  readRDS("/project/xuanyao/jiaming/Getting_started/data/CDT4/topic_model/flames+200kb/de_50.rds")
+de <-  readRDS("/project/xuanyao/jiaming/Getting_started/data/CDT4/topic_model/flames+200kb/de_40.rds")
 
 
 
@@ -921,16 +921,48 @@ tbl <- dfl2 %>%
   left_join(rsid_locations %>% dplyr::select(rsid, cluster_id), by = "rsid") %>%
   mutate(cluster_id = ifelse(is.na(cluster_id), paste0("solo_", ensg), cluster_id))
 
-# 4. Aggregate by module + cluster_id -> 4-column merged_df
+# 4. Within each module, find connected components of a gene–cluster bipartite graph.
+#    Two genes (or two clusters) end up in the same component if they are bridged by a
+#    shared gene or a shared cluster anywhere in the chain — enabling transitive merging.
+#    e.g. gene1↔cluster_A, gene1↔cluster_B  →  gene1 + all genes in cluster_B form one row.
+library(igraph)
+
 merged_df <- tbl %>%
-  group_by(module, cluster_id) %>%
-  summarise(
-    snp_geneset      = min(snp_geneset,   na.rm = TRUE),
-    geneset_trait    = min(geneset_trait, na.rm = TRUE),
-    merged_gene_name = paste(sort(unique(symbol[!is.na(symbol)])), collapse = "-"),
-    merged_loci      = paste(sort(unique(rsid[!is.na(rsid)])),     collapse = "-"),
-    .groups = "drop"
-  ) %>%
+  group_by(module) %>%
+  group_modify(function(df, key) {
+    # Build bipartite edges: gene node  <->  cluster node
+    # Use ENSG as fallback node label when symbol is missing
+    edges <- df %>%
+      transmute(
+        gene_node    = paste0("g:", ifelse(!is.na(symbol), symbol, ensg)),
+        cluster_node = paste0("c:", cluster_id)
+      ) %>%
+      distinct()
+
+    g    <- igraph::graph_from_data_frame(edges, directed = FALSE)
+    comp <- igraph::components(g)$membership          # named vector: node -> comp_id
+
+    # Map each row back to its component via the cluster node
+    node_comp <- tibble(node = names(comp), comp_id = as.integer(comp))
+
+    df %>%
+      left_join(
+        node_comp %>%
+          filter(startsWith(node, "c:")) %>%
+          transmute(cluster_id = sub("^c:", "", node), comp_id),
+        by = "cluster_id"
+      ) %>%
+      group_by(comp_id) %>%
+      summarise(
+        snp_geneset      = min(snp_geneset,   na.rm = TRUE),
+        geneset_trait    = min(geneset_trait, na.rm = TRUE),
+        merged_gene_name = paste(sort(unique(symbol[!is.na(symbol)])), collapse = "-"),
+        merged_loci      = paste(sort(unique(rsid[!is.na(rsid)])),     collapse = "-"),
+        .groups = "drop"
+      ) %>%
+      dplyr::select(-comp_id)
+  }) %>%
+  ungroup() %>%
   mutate(
     summary = paste0(merged_gene_name, "(", merged_loci, ")")
   ) %>%
@@ -954,7 +986,7 @@ The 21 significant mediating gene sets identified by AdaFilter (at nominal α = 
 
 ```{r}
 significant_modules <- c("k6","k8",  "k2" , "k26" ,"k3" , "k30" ,"k32" ,"k33" ,"k38" ,"k39", "k4",  "k45", "k46", "k49" ,"k7",
-"k5",  "k16" ,"k44" ,"k19")
+"k5",  "k16" ,"k44" ,"k19","k25","k28")
 
 sig_GO <- readRDS("/project/xuanyao/jiaming/paper/output/mediation_analysis/MCH/flames+200kb/k50/sig_GO.rds")
 
@@ -1240,7 +1272,9 @@ plot_gene_module_network_MCH <- function(df12,
                                       haemoglobin_genes = NULL,
                                       cell_cycle_genes  = NULL,
                                       autophagy_genes   = NULL,
-                                      unclassified_alpha = 0.3
+                                      unclassified_alpha = 0.3,
+                                      label_unclassified_genes = FALSE,
+                                      gene_label_cex = 0.7
                                       ) {
 
   edge_by <- match.arg(edge_by)
@@ -1448,14 +1482,15 @@ plot_gene_module_network_MCH <- function(df12,
 
   # ── 标签 ─────────────────────────────────────────────────────────────────────
   igraph::V(g)$label      <- NA_character_
-  igraph::V(g)$label.cex  <- ifelse(igraph::V(g)$type == "module", 0.9, 0.7)
+  igraph::V(g)$label.cex  <- ifelse(igraph::V(g)$type == "module", 0.9, gene_label_cex)
   igraph::V(g)$label.color <- "black"
   if (label_modules) {
     for (idx in mod_ids)  igraph::V(g)$label[idx] <- igraph::V(g)$name[idx]
   }
   if (label_genes) {
     for (idx in gene_ids) {
-      if (length(get_gene_categories(igraph::V(g)$name[idx])) > 0)
+      cats <- get_gene_categories(igraph::V(g)$name[idx])
+      if (length(cats) > 0 || label_unclassified_genes)
         igraph::V(g)$label[idx] <- igraph::V(g)$name[idx]
     }
   }
@@ -1543,6 +1578,8 @@ The bipartite network connects peripheral gene nodes (circles) to topic module n
 
 
 ```{r,fig.width=30,fig.height=30}
+
+merged_df <- readRDS("/project/xuanyao/jiaming/paper/output/mediation_analysis/MCH/flames+200kb/k50/merged_df.rds")
 plot_gene_module_network_MCH(
   df12              = merged_df,
   sig_GO            = sig_GO,          # 含 module + summary 列
@@ -1554,6 +1591,90 @@ plot_gene_module_network_MCH(
   edge_by           = "none",
  unclassified_alpha =0.3
 )
+```
+
+```{r erythroid-spec-network, fig.width=30, fig.height=30}
+target_genes  <- c("KLF1", "TAL1", "GFI1B", "ZFPM1", "MYB", "LDB1", "NFE2")
+erythroid_df  <- merged_df %>%
+  dplyr::filter(
+    sapply(strsplit(merged_gene_name, "-"),
+           function(parts) any(parts %in% target_genes))
+  )
+
+plot_gene_module_network_MCH(
+  df12                     = erythroid_df,
+  sig_GO                   = sig_GO,
+  haemoglobin_genes        = haemoglobin_genes,
+  cell_cycle_genes         = cell_cycle_genes,
+  autophagy_genes          = autophagy_genes,
+  top_n_gene               = 800,
+  size_scale               = 0.3,
+  edge_by                  = "none",
+  unclassified_alpha       = 0.3,
+  label_unclassified_genes = TRUE,
+  gene_label_cex           = 2
+)
+title("Canonical erythroid regulators peripheral genes", cex.main = 2)
+
+setwd("/project/xuanyao/jiaming/paper/output/mediation_analysis/MCH/flames+200kb/k50")
+pdf("erythroid_spec_network.pdf", width = 20, height = 20)
+plot_gene_module_network_MCH(
+  df12                     = erythroid_df,
+  sig_GO                   = sig_GO,
+  haemoglobin_genes        = haemoglobin_genes,
+  cell_cycle_genes         = cell_cycle_genes,
+  autophagy_genes          = autophagy_genes,
+  top_n_gene               = 800,
+  size_scale               = 0.6,
+  edge_by                  = "none",
+  unclassified_alpha       = 0.3,
+  label_unclassified_genes = TRUE,
+  gene_label_cex           = 2
+)
+title("Canonical erythroid regulators peripheral genes", cex.main = 2)
+dev.off()
+```
+
+```{r, fig.width=30, fig.height=30}
+target_genes  <- c("ALAS2", "ABCB10", "TFRC")
+erythroid_df  <- merged_df %>%
+  dplyr::filter(
+    sapply(strsplit(merged_gene_name, "-"),
+           function(parts) any(parts %in% target_genes))
+  )
+
+plot_gene_module_network_MCH(
+  df12                     = erythroid_df,
+  sig_GO                   = sig_GO,
+  haemoglobin_genes        = haemoglobin_genes,
+  cell_cycle_genes         = cell_cycle_genes,
+  autophagy_genes          = autophagy_genes,
+  top_n_gene               = 800,
+  size_scale               = 0.3,
+  edge_by                  = "none",
+  unclassified_alpha       = 0.3,
+  label_unclassified_genes = TRUE,
+  gene_label_cex           = 2
+)
+title("erythroid specification peripheral genes", cex.main = 2)
+
+setwd("/project/xuanyao/jiaming/paper/output/mediation_analysis/MCH/flames+200kb/k50")
+pdf("heme_and_iron_biology.pdf", width = 20, height = 20)
+plot_gene_module_network_MCH(
+  df12                     = erythroid_df,
+  sig_GO                   = sig_GO,
+  haemoglobin_genes        = haemoglobin_genes,
+  cell_cycle_genes         = cell_cycle_genes,
+  autophagy_genes          = autophagy_genes,
+  top_n_gene               = 800,
+  size_scale               = 0.6,
+  edge_by                  = "none",
+  unclassified_alpha       = 0.3,
+  label_unclassified_genes = TRUE,
+  gene_label_cex           = 2
+)
+title("heme and iron biology peripheral genes", cex.main = 2)
+dev.off()
 ```
 
 
@@ -1572,7 +1693,7 @@ g <- plot_gene_module_network_MCH(
 )
 
 # ↓ 只需要这两行，不要再单独 plot(g)
-png("/project/xuanyao/jiaming/Getting_started/data/GWAS/MCH/flames+200kb_mapping/gene_module_network.png",
+png("/project/xuanyao/jiaming/paper/output/mediation_analysis/MCH/flames+200kb/k50/gene_module_network.png",
     width = 12000, height = 12000, res = 500)
 # 重新调用函数并传入 out_pdf=NULL，让函数内部画到已打开的PNG设备
 plot_gene_module_network_MCH(
@@ -1595,21 +1716,19 @@ dev.off()
 
 For each module, the focal module (square) is placed at the centre; its peripheral gene nodes from `merged_df$summary` (circles) form an inner ring; and any other module that shares at least one peripheral gene is placed in an outer ring (without expanding its own peripheral genes). Colors and edge coloring follow the same logic as `plot_gene_module_network_MCH`.
 
-```{r plot-module-ego-MCH, fig.width=12, fig.height=12}
+```{r, fig.width=12, fig.height=12}
 plot_module_ego_MCH <- function(focal_module,
                                  df12,
                                  sig_GO,
-                                 haemoglobin_genes,
-                                 cell_cycle_genes,
-                                 autophagy_genes,
+                                 geneset_categories = NULL,
                                  unclassified_alpha = 0.3,
-                                 gene_size      = 10,
+                                 gene_size      = 6,
                                  focal_size     = 30,
                                  other_mod_size = 22,
                                  label_genes    = TRUE,
                                  label_cex      = 0.75) {
 
-  # ── colour helpers (identical to plot_gene_module_network_MCH) ───────────────
+  # ── colour helpers ───────────────────────────────────────────────────────────
   mix_hex_colors <- function(hex_vec) {
     if (length(hex_vec) == 1) return(hex_vec)
     rgb_mat <- grDevices::col2rgb(hex_vec)
@@ -1621,20 +1740,7 @@ plot_module_ego_MCH <- function(focal_module,
   col_haem  <- "#E74C3C"
   col_cycle <- "#F1C40F"
   col_auto  <- "#3498DB"
-  default_gene_col   <- "grey60"
   default_module_col <- "grey10"
-  cat_to_col <- c(haem = col_haem, cycle = col_cycle, auto = col_auto)
-
-  get_gene_color <- function(raw_name) {
-    no_snp     <- trimws(sub("\\s*\\(.*", "", raw_name))
-    pure_names <- unlist(strsplit(no_snp, "-"))
-    cats <- character(0)
-    if (!is.null(haemoglobin_genes) && any(pure_names %in% haemoglobin_genes)) cats <- c(cats, col_haem)
-    if (!is.null(cell_cycle_genes)  && any(pure_names %in% cell_cycle_genes))  cats <- c(cats, col_cycle)
-    if (!is.null(autophagy_genes)   && any(pure_names %in% autophagy_genes))   cats <- c(cats, col_auto)
-    if (length(cats) == 0) return(add_alpha(default_gene_col, unclassified_alpha))
-    add_alpha(mix_hex_colors(cats), 1.0)
-  }
 
   get_module_color <- function(mod_name) {
     if (is.null(sig_GO)) return(add_alpha(default_module_col, unclassified_alpha))
@@ -1649,28 +1755,6 @@ plot_module_ego_MCH <- function(focal_module,
     mix_hex_colors(cats)
   }
 
-  get_gene_categories <- function(raw_name) {
-    no_snp     <- trimws(sub("\\s*\\(.*", "", raw_name))
-    pure_names <- unlist(strsplit(no_snp, "-"))
-    cats <- character(0)
-    if (!is.null(haemoglobin_genes) && any(pure_names %in% haemoglobin_genes)) cats <- c(cats, "haem")
-    if (!is.null(cell_cycle_genes)  && any(pure_names %in% cell_cycle_genes))  cats <- c(cats, "cycle")
-    if (!is.null(autophagy_genes)   && any(pure_names %in% autophagy_genes))   cats <- c(cats, "auto")
-    cats
-  }
-
-  get_module_categories <- function(mod_name) {
-    if (is.null(sig_GO)) return(character(0))
-    rows <- sig_GO[sig_GO$module == mod_name, , drop = FALSE]
-    if (nrow(rows) == 0) return(character(0))
-    summ <- paste(rows$summary, collapse = " ")
-    cats <- character(0)
-    if (grepl("hemoglobin|haemoglobin", summ, ignore.case = TRUE)) cats <- c(cats, "haem")
-    if (grepl("cell cycle",             summ, ignore.case = TRUE)) cats <- c(cats, "cycle")
-    if (grepl("autophagy",              summ, ignore.case = TRUE)) cats <- c(cats, "auto")
-    cats
-  }
-
   # ── data ─────────────────────────────────────────────────────────────────────
   focal_rows <- df12 %>% dplyr::filter(module == focal_module)
   if (nrow(focal_rows) == 0) {
@@ -1678,14 +1762,28 @@ plot_module_ego_MCH <- function(focal_module,
     return(invisible(NULL))
   }
 
-  # other modules sharing at least one merged_gene_name with the focal module
   other_mod_rows <- df12 %>%
     dplyr::filter(merged_gene_name %in% focal_rows$merged_gene_name,
                   module != focal_module) %>%
     dplyr::select(module, merged_gene_name) %>%
     dplyr::distinct()
 
-  # ── vertices ──────────────────────────────────────────────────────────────────
+  # ── gene connectivity: # other modules each gene connects to ─────────────────
+  gene_conn_tbl <- other_mod_rows %>%
+    dplyr::group_by(merged_gene_name) %>%
+    dplyr::summarise(n_modules = dplyr::n_distinct(module), .groups = "drop")
+  gene_conn_map <- setNames(gene_conn_tbl$n_modules, gene_conn_tbl$merged_gene_name)
+
+  max_conn <- max(c(unlist(gene_conn_map), 1L))  # at least 1 to avoid degenerate palette
+  gene_pal <- colorRampPalette(c("#cfe2f3", "#08306b"))(max_conn + 1)
+
+  get_gene_color <- function(raw_name) {
+    if (is.null(raw_name) || is.na(raw_name)) return("grey60")
+    n <- if (raw_name %in% names(gene_conn_map)) gene_conn_map[[raw_name]] else 0L
+    gene_pal[n + 1]
+  }
+
+  # ── vertices ─────────────────────────────────────────────────────────────────
   focal_v <- data.frame(name      = focal_module,
                          vtype     = "focal_module",
                          gene_raw  = NA_character_,
@@ -1743,56 +1841,32 @@ plot_module_ego_MCH <- function(focal_module,
     rows <- sig_GO[sig_GO$module == mod_name, , drop = FALSE]
     if (nrow(rows) == 0 || all(is.na(rows$summary))) return(mod_name)
     fn <- rows$summary[1]
-    # wrap long summaries at 30 chars
     fn_wrapped <- paste(strwrap(fn, width = 30), collapse = "\n")
     paste0(mod_name, "\n", fn_wrapped)
   }
 
-  igraph::V(g)$label <- vapply(seq_len(igraph::vcount(g)), function(i) {
+igraph::V(g)$label <- vapply(seq_len(igraph::vcount(g)), function(i) {
     vt  <- igraph::V(g)$vtype[i]
     nm  <- igraph::V(g)$name[i]
     raw <- igraph::V(g)$gene_raw[i]
-    loc <- igraph::V(g)$gene_loci[i]
     if (vt == "focal_module") {
       get_module_label(nm)
     } else if (vt == "other_module") {
-      NA_character_
+      nm                          # ← 只显示模块名
     } else {
-      # gene: only label if it has a biological category (colored)
-      if (!label_genes || length(get_gene_categories(raw)) == 0)
-        NA_character_
-      else
-        raw
+      if (!label_genes) NA_character_ else raw
     }
   }, character(1))
+
   igraph::V(g)$label.cex <- ifelse(igraph::V(g)$vtype == "focal_module", 0.85,
                                     ifelse(igraph::V(g)$vtype == "other_module", 0.7,
                                            label_cex))
 
-  # ── edge colours (same logic as plot_gene_module_network_MCH) ────────────────
-  el        <- igraph::get.edgelist(g)
-  vtype_map <- setNames(igraph::V(g)$vtype,    igraph::V(g)$name)
-  vraw_map  <- setNames(igraph::V(g)$gene_raw, igraph::V(g)$name)
-  edge_col  <- character(nrow(el))
-  edge_bold <- logical(nrow(el))
+  # ── edge colours ─────────────────────────────────────────────────────────────
+  igraph::E(g)$color <- "grey70"
+  igraph::E(g)$width <- 1
 
-  for (i in seq_len(nrow(el))) {
-    n1 <- el[i, 1]; n2 <- el[i, 2]
-    if (vtype_map[n1] == "gene") { gn <- vraw_map[n1]; mn <- n2 }
-    else                         { gn <- vraw_map[n2]; mn <- n1 }
-    shared <- intersect(get_gene_categories(gn), get_module_categories(mn))
-    if (length(shared) > 0) {
-      edge_col[i]  <- mix_hex_colors(cat_to_col[shared])
-      edge_bold[i] <- TRUE
-    } else {
-      edge_col[i]  <- "grey70"
-      edge_bold[i] <- FALSE
-    }
-  }
-  igraph::E(g)$color <- edge_col
-  igraph::E(g)$width <- ifelse(edge_bold, 3, 1)
-
-  # ── concentric layout: focal (centre) → gene ring (r=1) → other-mod ring (r=2)
+  # ── concentric layout ─────────────────────────────────────────────────────────
   focal_idx <- which(igraph::V(g)$vtype == "focal_module")
   gene_idx  <- which(igraph::V(g)$vtype == "gene")
   other_idx <- which(igraph::V(g)$vtype == "other_module")
@@ -1805,19 +1879,18 @@ plot_module_ego_MCH <- function(focal_module,
   if (n_genes > 0) {
     th <- seq(0, 2 * pi, length.out = n_genes + 1)[seq_len(n_genes)]
 
-    # spread colored genes evenly; fill gaps with uncolored
-    is_colored <- vapply(igraph::V(g)$gene_raw[gene_idx],
-                         function(r) length(get_gene_categories(r)) > 0,
-                         logical(1))
-    colored_pos   <- which(is_colored)
-    uncolored_pos <- which(!is_colored)
-    n_colored     <- length(colored_pos)
+    conn_layout <- vapply(igraph::V(g)$gene_raw[gene_idx], function(r) {
+      if (!is.null(r) && !is.na(r) && r %in% names(gene_conn_map)) gene_conn_map[[r]] else 0L
+    }, integer(1))
+    connected_pos   <- which(conn_layout > 0)
+    unconnected_pos <- which(conn_layout == 0)
+    n_connected     <- length(connected_pos)
 
-    if (n_colored > 0 && n_colored < n_genes) {
-      colored_slots <- round(seq(1, n_genes, length.out = n_colored))
+    if (n_connected > 0 && n_connected < n_genes) {
+      connected_slots <- round(seq(1, n_genes, length.out = n_connected))
       new_order                          <- integer(n_genes)
-      new_order[colored_slots]           <- colored_pos
-      new_order[setdiff(seq_len(n_genes), colored_slots)] <- uncolored_pos
+      new_order[connected_slots]           <- connected_pos
+      new_order[setdiff(seq_len(n_genes), connected_slots)] <- unconnected_pos
       gene_idx_ord <- gene_idx[new_order]
     } else {
       gene_idx_ord <- gene_idx
@@ -1828,7 +1901,6 @@ plot_module_ego_MCH <- function(focal_module,
   }
 
   if (n_others > 0) {
-    # place each other-module near the mean angle of its connected gene nodes
     gene_angles  <- setNames(atan2(lay[gene_idx, 2], lay[gene_idx, 1]),
                               igraph::V(g)$name[gene_idx])
     other_names  <- igraph::V(g)$name[other_idx]
@@ -1848,26 +1920,35 @@ plot_module_ego_MCH <- function(focal_module,
     }
   }
 
-  # build title: module ID + biological function if available
-  focal_fn <- if (!is.null(sig_GO)) {
-    rows <- sig_GO[sig_GO$module == focal_module, , drop = FALSE]
-    if (nrow(rows) > 0 && !is.na(rows$summary[1])) rows$summary[1] else ""
-  } else ""
-  main_title <- if (nchar(focal_fn) > 0)
-    paste0("Module ", focal_module, " — ", focal_fn)
+  # ── title ─────────────────────────────────────────────────────────────────────
+  detail_label <- if (!is.null(geneset_categories)) {
+    cat_row <- geneset_categories[geneset_categories$module == focal_module, , drop = FALSE]
+    if (nrow(cat_row) > 0 && !is.na(cat_row$detail[1]) && nzchar(cat_row$detail[1]))
+      cat_row$detail[1]
+    else
+      NA_character_
+  } else NA_character_
+
+  main_title <- if (!is.na(detail_label))
+    paste0("Module ", focal_module, "\n", detail_label)
   else
     paste0("Module ", focal_module)
 
-  # ── per-node label placement: gene labels point outward to reduce overlap ─────
+  # ── per-node label placement ──────────────────────────────────────────────────
   n_v          <- igraph::vcount(g)
   lbl_dist     <- rep(0.5, n_v)
-  lbl_degree   <- rep(-pi / 2, n_v)   # default: above node
+  lbl_degree   <- rep(-pi / 2, n_v)
 
   for (i in seq_len(n_v)) {
     if (igraph::V(g)$vtype[i] == "gene") {
       angle            <- atan2(lay[i, 2], lay[i, 1])
-      lbl_degree[i]    <- angle          # label radiates outward from centre
+      lbl_degree[i]    <- angle
       lbl_dist[i]      <- 1.5
+    } else if (igraph::V(g)$vtype[i] == "other_module") {
+      # other module 标签也向外辐射，距离稍大以避免与节点重叠
+      angle            <- atan2(lay[i, 2], lay[i, 1])
+      lbl_degree[i]    <- angle
+      lbl_dist[i]      <- 1.2
     }
   }
 
@@ -1878,40 +1959,117 @@ plot_module_ego_MCH <- function(focal_module,
        main        = main_title,
        edge.curved = 0.2)
 
-  # ── legend ────────────────────────────────────────────────────────────────────
+  # ── legend: gene connectivity gradient ───────────────────────────────────────
+  legend_n      <- min(max_conn + 1, 6)
+  legend_counts <- round(seq(0, max_conn, length.out = legend_n))
+  legend_cols   <- gene_pal[legend_counts + 1]
+  legend_labels <- ifelse(legend_counts == 0, "0 other modules",
+                          paste0(legend_counts, " other module",
+                                 ifelse(legend_counts == 1, "", "s")))
   legend(
     "bottomright",
-    legend = c("Haemoglobin / erythroid",
-               "Cell cycle",
-               "Autophagy",
-               "Unclassified"),
-    pt.bg  = c(col_haem, col_cycle, col_auto,
-               add_alpha(default_gene_col, unclassified_alpha)),
+    legend = legend_labels,
+    pt.bg  = legend_cols,
     col    = "black",
     pch    = 21,
     pt.cex = 1.6,
     bty    = "n",
     cex    = 0.8,
-    title  = expression(bold("Biological category"))
+    title  = expression(bold("# connected modules"))
   )
 
   invisible(g)
 }
+```
 
-# Draw one ego-network per module present in merged_df
+
+```{r plot-module-ego-MCH, fig.width=12, fig.height=12}
+library(readxl)
+geneset_categories <- read_excel("/project/xuanyao/jiaming/paper/output/mediation_analysis/MCH/flames+200kb/k50/sig_GO_MCH_k50.xlsx")
+setwd("/project/xuanyao/jiaming/paper/output/mediation_analysis/MCH/flames+200kb/k50")
+
 for (mod in sort(unique(merged_df$module))) {
   plot_module_ego_MCH(
     focal_module       = mod,
     df12               = merged_df,
     sig_GO             = sig_GO,
-    haemoglobin_genes  = haemoglobin_genes,
-    cell_cycle_genes   = cell_cycle_genes,
-    autophagy_genes    = autophagy_genes,
+    geneset_categories = geneset_categories,
     unclassified_alpha = 0.3
   )
+  pdf(paste0("MCH_ego_", mod, ".pdf"), width = 12, height = 12)
+  plot_module_ego_MCH(
+    focal_module       = mod,
+    df12               = merged_df,
+    sig_GO             = sig_GO,
+    geneset_categories = geneset_categories,
+    unclassified_alpha = 0.3
+  )
+  dev.off()
 }
 ```
 
+###————————April 12 Update——————————————
+
+#### Summary: how many modules does each peripheral gene regulate?
+
+```{r fig.width=7, fig.height=4}
+gene_module_counts <- merged_df %>%
+  filter(merged_gene_name != "") %>%
+  separate_rows(merged_gene_name, sep = "-") %>%
+  filter(merged_gene_name != "") %>%
+  distinct(merged_gene_name, module) %>%
+  count(merged_gene_name, name = "n_modules")
+
+ggplot(gene_module_counts, aes(x = n_modules)) +
+  geom_histogram(binwidth = 1, fill = "#4C72B0", color = "white") +
+  scale_x_continuous(breaks = seq(1, max(gene_module_counts$n_modules), by = 1)) +
+  labs(
+    title = "Distribution of modules regulated per peripheral gene",
+    x = "Number of modules regulated",
+    y = "Number of genes"
+  ) +
+  theme_bw(base_size = 13)
+```
+
+```{r}
+which(table(merged_df$merged_gene_name)>17)
+
+gene_symbols <- c("EIF2B5", "MED12", "PTPN1", "TRRAP", "XRN2")
+
+# 用 gtf_df 做映射
+result <- data.frame(
+  symbol = gene_symbols
+) %>%
+  left_join(gtf_df, by = "symbol")
+
+result
+```
+
+
+
+
+#### Summary: how many peripheral genes regulate each module?
+
+```{r fig.width=9, fig.height=5}
+module_gene_counts <- merged_df %>%
+  filter(merged_gene_name != "") %>%
+  separate_rows(merged_gene_name, sep = "-") %>%
+  filter(merged_gene_name != "") %>%
+  distinct(module, merged_gene_name) %>%
+  count(module, name = "n_genes") %>%
+  arrange(desc(n_genes)) %>%
+  mutate(module = factor(module, levels = module))
+
+ggplot(module_gene_counts, aes(x = module, y = n_genes)) +
+  geom_bar(stat = "identity", fill = "#DD8452") +
+  labs(
+    title = "Number of peripheral genes regulating each module (sorted)",
+    x = "Module",
+    y = "Number of regulating genes"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
 
 
 ## Gene-level evidence within significant mediating modules
@@ -1971,7 +2129,7 @@ results_list <- list()
 pval_list    <- list()   # 新增：储存每个 snp-module 的 p value 向量
 
 # 设为 NULL 则计算所有 guide；设为具体 guide ID 则只计算该 guide
-target_guide <- "gRNA:ENSG00000179115"
+target_guide <- c("gRNA:ENSG00000145191","gRNA:ENSG00000184634","gRNA:ENSG00000196396","gRNA:ENSG00000196367","gRNA:ENSG00000088930")
 if (!is.null(target_guide)) key_snps <- intersect(key_snps, target_guide)
 
 for (i in seq_along(key_snps)) {
@@ -2240,8 +2398,16 @@ plot_module_qqplot <- function(guide_id, pval_df) {
 ```
 
 ```{r}
-plot_guide_heatmap("gRNA:ENSG00000179115", pval_df)
-plot_module_qqplot("gRNA:ENSG00000179115", pval_df)
+plot_guide_heatmap("gRNA:ENSG00000184634", pval_df)
+plot_module_qqplot("gRNA:ENSG00000184634", pval_df)
+plot_guide_heatmap("gRNA:ENSG00000196367", pval_df)
+plot_module_qqplot("gRNA:ENSG00000196367", pval_df)
+plot_guide_heatmap("gRNA:ENSG00000088930", pval_df)
+plot_module_qqplot("gRNA:ENSG00000088930", pval_df)
+plot_guide_heatmap("gRNA:ENSG00000196396", pval_df)
+plot_module_qqplot("gRNA:ENSG00000196396", pval_df)
+plot_guide_heatmap("gRNA:ENSG00000145191", pval_df)
+plot_module_qqplot("gRNA:ENSG00000145191", pval_df)
 ```
 
 
@@ -2279,6 +2445,9 @@ legend("topright",
        border = NA,
        bty    = "n")
 ```
+
+
+
 
 
 
@@ -4383,7 +4552,7 @@ discovery_pairs_cis <- readRDS("/project/xuanyao/jiaming/Getting_started/data/CD
 
  gene_modules_id <- readRDS("/project/xuanyao/jiaming/Getting_started/data/CDT4/topic_geneset/flames+200kb/de_50_0.01_2_0.5.rds")
 
-
+# gene_modules_id<-filtered_list_2
 
 
 # -----------------------------
@@ -4518,7 +4687,7 @@ library(tidyr)
 library(dplyr)
 library(tibble)
 
-snp_geneset_p_value<-  readRDS("/project/xuanyao/jiaming/paper/output/snake/CDT4_asthma/flames_200kb/K50/3000_t_ACAT_resample/p_values/geneset_p_value.rds")
+snp_geneset_p_value<-  readRDS("/project/xuanyao/jiaming/paper/output/snake/CDT4_asthma/flames+200kb/K50_optimized/3000_t_ACAT_resample/p_values/geneset_p_value.rds")
 snp_geneset_p_value_test <- snp_geneset_p_value[which(!grepl("NTC-",rownames(snp_geneset_p_value))),]
 snp_geneset_p_value_control <- snp_geneset_p_value[which(grepl("NTC-",rownames(snp_geneset_p_value))),]
 
@@ -4565,16 +4734,430 @@ module_sizes <- lengths(gene_modules_id)
 merged <- merged %>% filter(module_sizes[module] > 1)
 
 X <- merged[,c(3,4)]
-result <- adaFilter(X, r = 2,alpha=0.13)
+result <- adaFilter(X, r = 2,alpha=0.15)
 
 merged$decision <- result$decision
 colnames(merged)[c(3,4)] <- c("snp_geneset","geneset_trait")
 
-merged[merged$decision==1,]
+dfl2<-merged[merged$decision==1,]
 ```
+
+
+The chunk below maps significant peripheral gene IDs (ENSG format from OPERA row names) back to gene symbols, and clusters them by genomic locus (200 kb window) so that co-located genes at the same GWAS locus are grouped together in downstream visualizations.
+
 ```{r}
-merged %>% arrange(geneset_trait + snp_geneset) %>% head()
+# 0. ENSG -> symbol mapping from GTF
+gtf <- rtracklayer::import("/project/xuanyao/jiaming/Getting_started/data/protein_coding_genes/Homo_sapiens.GRCh38.112.gtf.gz",
+                            feature.type = "gene")
+gtf_df <- as.data.frame(gtf)[, c("gene_id", "gene_name")]
+colnames(gtf_df) <- c("ensg", "symbol")
+ensg_to_symbol <- setNames(gtf_df$symbol, gtf_df$ensg)
+
+# 1. Build rsid -> cluster_id: merge GWAS loci within 200kb on the same chromosome
+gwas_result <- readRDS("/project/xuanyao/jiaming/Getting_started/data/GWAS/asthma/GCST010043/flames+200kb/result.rds")
+
+rsid_locations <- gwas_result %>%
+  dplyr::select(rsid, locations) %>%
+  distinct() %>%
+  filter(!is.na(locations)) %>%
+  mutate(
+    chr = sub(":.*", "", locations),
+    # suppressWarnings: non-autosomal (X/Y/MT) or malformed entries produce NA,
+    # which are removed by the chr filter below — this is expected
+    pos = suppressWarnings(as.numeric(sub(".*:", "", locations)))
+  ) %>%
+  filter(chr %in% as.character(1:22)) %>%
+  arrange(chr, pos) %>%
+  group_by(chr) %>%
+  mutate(cluster_num = cumsum(c(1, diff(pos) > 200000))) %>%
+  ungroup() %>%
+  mutate(cluster_id = paste0(chr, "_", cluster_num)) %>%
+  dplyr::select(rsid, chr, pos, cluster_id)
+
+# 2. symbol -> rsid mapping from gwas_result (bridge: ENSG -> symbol -> rsid)
+symbol_to_rsid <- gwas_result %>%
+  filter(!is.na(symbol)) %>%
+  dplyr::select(symbol, rsid) %>%
+  distinct()
+
+tbl <- dfl2 %>%
+  mutate(symbol = snp) %>%
+  # many-to-many is expected: one gene can be near multiple GWAS loci (multiple rsids),
+  # and the same gene can appear in multiple modules. Rows are collapsed in step 4
+  # by group_by(module, cluster_id).
+  left_join(symbol_to_rsid, by = "symbol", relationship = "many-to-many") %>%
+  left_join(rsid_locations %>% dplyr::select(rsid, cluster_id), by = "rsid") %>%
+  mutate(cluster_id = ifelse(is.na(cluster_id), paste0("solo_", ensg), cluster_id))
+
+# 4. Within each module, find connected components of a gene–cluster bipartite graph.
+#    Two genes (or two clusters) end up in the same component if they are bridged by a
+#    shared gene or a shared cluster anywhere in the chain — enabling transitive merging.
+#    e.g. gene1↔cluster_A, gene1↔cluster_B  →  gene1 + all genes in cluster_B form one row.
+library(igraph)
+
+merged_df <- tbl %>%
+  group_by(module) %>%
+  group_modify(function(df, key) {
+    # Build bipartite edges: gene node  <->  cluster node
+    # Use ENSG as fallback node label when symbol is missing
+    edges <- df %>%
+      transmute(
+        gene_node    = paste0("g:", ifelse(!is.na(symbol), symbol, ensg)),
+        cluster_node = paste0("c:", cluster_id)
+      ) %>%
+      distinct()
+
+    g    <- igraph::graph_from_data_frame(edges, directed = FALSE)
+    comp <- igraph::components(g)$membership          # named vector: node -> comp_id
+
+    # Map each row back to its component via the cluster node
+    node_comp <- tibble(node = names(comp), comp_id = as.integer(comp))
+
+    df %>%
+      left_join(
+        node_comp %>%
+          filter(startsWith(node, "c:")) %>%
+          transmute(cluster_id = sub("^c:", "", node), comp_id),
+        by = "cluster_id"
+      ) %>%
+      group_by(comp_id) %>%
+      summarise(
+        snp_geneset      = min(snp_geneset,   na.rm = TRUE),
+        geneset_trait    = min(geneset_trait, na.rm = TRUE),
+        merged_gene_name = paste(sort(unique(symbol[!is.na(symbol)])), collapse = "-"),
+        merged_loci      = paste(sort(unique(rsid[!is.na(rsid)])),     collapse = "-"),
+        .groups = "drop"
+      ) %>%
+      dplyr::select(-comp_id)
+  }) %>%
+  ungroup() %>%
+  mutate(
+    summary = paste0(merged_gene_name, "(", merged_loci, ")")
+  ) %>%
+  dplyr::select(module, merged_gene_name, merged_loci, summary)
+
+head(merged_df)
 ```
+
+
+## Gene–module network visualization
+
+```{r plot-asthma-network-fn, include=FALSE}
+# ── Simplified network plot (no biological colour coding) ────────────────────
+plot_gene_module_network_asthma <- function(df12,
+                                            top_n_per_module = NULL,
+                                            top_n_gene       = 600,
+                                            pcap             = 1e-300,
+                                            layout_fun       = NULL,
+                                            out_pdf          = NULL,
+                                            width            = 12, height = 9,
+                                            label_genes      = TRUE,
+                                            label_modules    = TRUE,
+                                            size_scale       = 0.7,
+                                            mod_size_range   = c(15, 40),
+                                            gene_size_range  = c(4,  20)) {
+
+  if (is.null(layout_fun)) layout_fun <- igraph::layout_with_fr
+
+  node_gene_col   <- "#AED6F1"   # light blue  – peripheral gene/locus nodes
+  node_module_col <- "#D5D8DC"   # light grey  – module nodes
+
+  # ── data ─────────────────────────────────────────────────────────────────────
+  d <- df12 %>%
+    dplyr::transmute(
+      module = as.character(module),
+      gene   = as.character(merged_gene_name),
+      p_snp  = pcap,
+      p_mod  = pcap
+    ) %>%
+    dplyr::filter(!is.na(module), !is.na(gene)) %>%
+    dplyr::group_by(module, gene) %>%
+    dplyr::summarise(p_snp = min(p_snp, na.rm = TRUE),
+                     p_mod = min(p_mod, na.rm = TRUE),
+                     .groups = "drop")
+
+  if (!is.null(top_n_per_module)) {
+    d <- d %>%
+      dplyr::group_by(module) %>%
+      dplyr::arrange(p_snp, .by_group = TRUE) %>%
+      dplyr::slice_head(n = top_n_per_module) %>%
+      dplyr::ungroup()
+  }
+
+  if (!is.null(top_n_gene)) {
+    top_genes <- d %>%
+      dplyr::group_by(gene) %>%
+      dplyr::summarise(best_p = min(p_snp, na.rm = TRUE), .groups = "drop") %>%
+      dplyr::arrange(best_p) %>%
+      dplyr::slice_head(n = top_n_gene) %>%
+      dplyr::pull(gene)
+    d <- d %>% dplyr::filter(gene %in% top_genes)
+  }
+
+  mod_tbl <- d %>%
+    dplyr::group_by(module) %>%
+    dplyr::summarise(p_mod = min(p_mod, na.rm = TRUE),
+                     n_assoc = dplyr::n_distinct(gene), .groups = "drop")
+
+  gene_tbl <- d %>%
+    dplyr::group_by(gene) %>%
+    dplyr::summarise(p_snp = min(p_snp, na.rm = TRUE),
+                     n_assoc = dplyr::n_distinct(module), .groups = "drop")
+
+  vertices <- dplyr::bind_rows(
+    mod_tbl  %>% dplyr::transmute(name = module, type = "module", weight = n_assoc),
+    gene_tbl %>% dplyr::transmute(name = gene,   type = "gene",   weight = n_assoc)
+  )
+
+  edges <- d %>% dplyr::transmute(from = module, to = gene, p_snp = p_snp)
+
+  g <- igraph::graph_from_data_frame(edges, directed = FALSE, vertices = vertices)
+
+  igraph::V(g)$shape       <- ifelse(igraph::V(g)$type == "module", "square", "circle")
+  igraph::V(g)$frame.color <- NA
+  igraph::V(g)$label.color <- "black"
+  igraph::V(g)$color       <- ifelse(igraph::V(g)$type == "module",
+                                     node_module_col, node_gene_col)
+
+  mod_ids  <- which(igraph::V(g)$type == "module")
+  gene_ids <- which(igraph::V(g)$type == "gene")
+
+  igraph::V(g)$size <- rep(NA_real_, igraph::vcount(g))
+
+  mod_w  <- igraph::V(g)$weight[mod_ids]
+  igraph::V(g)$size[mod_ids] <- if (length(unique(mod_w)) == 1) {
+    rep(mean(mod_size_range) * size_scale, length(mod_ids))
+  } else {
+    scales::rescale(mod_w, to = mod_size_range * size_scale)
+  }
+
+  gene_w <- igraph::V(g)$weight[gene_ids]
+  igraph::V(g)$size[gene_ids] <- if (length(unique(gene_w)) == 1) {
+    rep(mean(gene_size_range) * size_scale, length(gene_ids))
+  } else {
+    scales::rescale(gene_w, to = gene_size_range * size_scale)
+  }
+
+  igraph::E(g)$color <- "grey70"
+  igraph::E(g)$width <- 1
+
+  igraph::V(g)$label     <- NA_character_
+  igraph::V(g)$label.cex <- ifelse(igraph::V(g)$type == "module", 0.9, 0.7)
+  if (label_modules) igraph::V(g)$label[mod_ids]  <- igraph::V(g)$name[mod_ids]
+  if (label_genes)   igraph::V(g)$label[gene_ids] <- igraph::V(g)$name[gene_ids]
+
+  lay <- layout_fun(g)
+  if (!is.null(out_pdf)) grDevices::pdf(out_pdf, width = width, height = height)
+  plot(g, layout = lay, vertex.label.dist = 0, edge.curved = 0)
+
+  usr    <- graphics::par("usr")
+  x_left <- usr[1] + 0.02 * (usr[2] - usr[1])
+  y_bot  <- usr[3] + 0.02 * (usr[4] - usr[3])
+  graphics::legend(
+    x = x_left, y = y_bot, xjust = 0, yjust = 0,
+    legend = c("Module", "Gene/locus"),
+    pt.bg  = c(node_module_col, node_gene_col),
+    col    = c(node_module_col, node_gene_col),
+    pch    = c(15, 19),
+    pt.cex = 2,
+    cex    = 1.1,
+    bty    = "o", box.col = "grey30", bg = "white"
+  )
+
+  if (!is.null(out_pdf)) grDevices::dev.off()
+  invisible(g)
+}
+
+# ── Simplified ego plot (no biological colour coding) ────────────────────────
+plot_module_ego_asthma <- function(focal_module,
+                                   df12,
+                                   geneset_categories = NULL,
+                                   gene_size      = 10,
+                                   focal_size     = 30,
+                                   other_mod_size = 22,
+                                   label_genes    = TRUE,
+                                   label_cex      = 0.75) {
+
+  node_gene_col   <- "#AED6F1"   # light blue  – peripheral gene/locus nodes
+  node_module_col <- "#D5D8DC"   # light grey  – module nodes
+
+  focal_rows <- df12 %>% dplyr::filter(module == focal_module)
+  if (nrow(focal_rows) == 0) {
+    message("No genes for module: ", focal_module)
+    return(invisible(NULL))
+  }
+
+  other_mod_rows <- df12 %>%
+    dplyr::filter(merged_gene_name %in% focal_rows$merged_gene_name,
+                  module != focal_module) %>%
+    dplyr::select(module, merged_gene_name) %>%
+    dplyr::distinct()
+
+  focal_v <- data.frame(name = focal_module, vtype = "focal_module",
+                         gene_raw = NA_character_, gene_loci = NA_character_,
+                         stringsAsFactors = FALSE)
+
+  gene_v <- focal_rows %>%
+    dplyr::transmute(name = summary, vtype = "gene",
+                     gene_raw = merged_gene_name, gene_loci = merged_loci)
+
+  other_v <- other_mod_rows %>%
+    dplyr::distinct(module) %>%
+    dplyr::transmute(name = module, vtype = "other_module",
+                     gene_raw = NA_character_, gene_loci = NA_character_)
+
+  verts <- dplyr::bind_rows(focal_v, gene_v, other_v)
+
+  edges_focal_gene <- focal_rows %>%
+    dplyr::transmute(from = focal_module, to = summary)
+
+  edges_gene_other <- other_mod_rows %>%
+    dplyr::left_join(
+      focal_rows %>% dplyr::select(merged_gene_name, summary),
+      by = "merged_gene_name", relationship = "many-to-many"
+    ) %>%
+    dplyr::transmute(from = summary, to = module) %>%
+    dplyr::distinct()
+
+  all_edges <- dplyr::bind_rows(edges_focal_gene, edges_gene_other)
+
+  g <- igraph::graph_from_data_frame(all_edges, directed = FALSE, vertices = verts)
+
+  is_module_node <- igraph::V(g)$vtype %in% c("focal_module", "other_module")
+  igraph::V(g)$shape       <- ifelse(is_module_node, "square", "circle")
+  igraph::V(g)$frame.color <- NA
+  igraph::V(g)$label.color <- "black"
+  igraph::V(g)$color       <- ifelse(is_module_node, node_module_col, node_gene_col)
+  igraph::V(g)$size        <- ifelse(igraph::V(g)$vtype == "focal_module", focal_size,
+                                      ifelse(igraph::V(g)$vtype == "other_module",
+                                             other_mod_size, gene_size))
+
+  igraph::V(g)$label <- vapply(seq_len(igraph::vcount(g)), function(i) {
+    vt <- igraph::V(g)$vtype[i]
+    nm <- igraph::V(g)$name[i]
+    if (vt == "focal_module") nm
+    else if (vt == "other_module") NA_character_
+    else if (label_genes) igraph::V(g)$gene_raw[i]
+    else NA_character_
+  }, character(1))
+
+  igraph::V(g)$label.cex <- ifelse(igraph::V(g)$vtype == "focal_module", 0.85,
+                                    ifelse(igraph::V(g)$vtype == "other_module", 0.7,
+                                           label_cex))
+
+  igraph::E(g)$color <- "grey70"
+  igraph::E(g)$width <- 1
+
+  # ── concentric layout ─────────────────────────────────────────────────────
+  focal_idx <- which(igraph::V(g)$vtype == "focal_module")
+  gene_idx  <- which(igraph::V(g)$vtype == "gene")
+  other_idx <- which(igraph::V(g)$vtype == "other_module")
+  n_genes   <- length(gene_idx)
+  n_others  <- length(other_idx)
+
+  lay <- matrix(0, nrow = igraph::vcount(g), ncol = 2)
+  lay[focal_idx, ] <- c(0, 0)
+
+  if (n_genes > 0) {
+    th <- seq(0, 2 * pi, length.out = n_genes + 1)[seq_len(n_genes)]
+    lay[gene_idx, 1] <- cos(th)
+    lay[gene_idx, 2] <- sin(th)
+  }
+
+  if (n_others > 0) {
+    gene_angles <- setNames(atan2(lay[gene_idx, 2], lay[gene_idx, 1]),
+                             igraph::V(g)$name[gene_idx])
+    other_names <- igraph::V(g)$name[other_idx]
+    for (j in seq_along(other_idx)) {
+      connected_summaries <- other_mod_rows %>%
+        dplyr::filter(module == other_names[j]) %>%
+        dplyr::left_join(focal_rows %>% dplyr::select(merged_gene_name, summary),
+                         by = "merged_gene_name") %>%
+        dplyr::pull(summary)
+      valid_angles <- gene_angles[intersect(connected_summaries, names(gene_angles))]
+      mean_angle <- if (length(valid_angles) > 0)
+        atan2(mean(sin(valid_angles)), mean(cos(valid_angles)))
+      else
+        2 * pi * (j - 1) / n_others
+      lay[other_idx[j], 1] <- 2 * cos(mean_angle)
+      lay[other_idx[j], 2] <- 2 * sin(mean_angle)
+    }
+  }
+
+  # per-node label placement: gene labels point outward
+  n_v        <- igraph::vcount(g)
+  lbl_dist   <- rep(0.5, n_v)
+  lbl_degree <- rep(-pi / 2, n_v)
+  for (i in seq_len(n_v)) {
+    if (igraph::V(g)$vtype[i] == "gene") {
+      lbl_degree[i] <- atan2(lay[i, 2], lay[i, 1])
+      lbl_dist[i]   <- 1.5
+    }
+  }
+  igraph::V(g)$label.dist   <- lbl_dist
+  igraph::V(g)$label.degree <- lbl_degree
+
+  cat_label <- if (!is.null(geneset_categories)) {
+    cat_row <- geneset_categories[geneset_categories[[1]] == focal_module, , drop = FALSE]
+    if (nrow(cat_row) > 0 && !is.na(cat_row[[2]][1]) && nzchar(cat_row[[2]][1]))
+      cat_row[[2]][1]
+    else
+      NA_character_
+  } else NA_character_
+
+  main_title <- if (!is.na(cat_label))
+    paste0("Module ", focal_module, "\n", cat_label)
+  else
+    paste0("Module ", focal_module)
+
+  plot(g, layout = lay, main = main_title, edge.curved = 0.2)
+
+  legend(
+    "bottomright",
+    legend = c("Module", "Gene/locus"),
+    pt.bg  = c(node_module_col, node_gene_col),
+    col    = "black",
+    pch    = c(22, 21),
+    pt.cex = 1.6,
+    bty    = "n", cex = 0.8
+  )
+
+  invisible(g)
+}
+```
+
+```{r plot-asthma-network, fig.width=20, fig.height=20}
+plot_gene_module_network_asthma(
+  df12      = merged_df,
+  top_n_gene = 800
+)
+```
+
+```{r}
+library(readxl)
+geneset_categories <- read_excel("/project/xuanyao/jiaming/paper/output/mediation_analysis/asthma/K50/geneset_categories.xlsx")
+```
+
+
+```{r plot-asthma-ego, fig.width=12, fig.height=12}
+setwd("/project/xuanyao/jiaming/paper/output/mediation_analysis/asthma/K50")
+for (mod in sort(unique(merged_df$module))) {
+  plot_module_ego_asthma(
+    focal_module       = mod,
+    df12               = merged_df,
+    geneset_categories = geneset_categories
+  )
+  pdf(paste0("asthma_ego_", mod, ".pdf"), width = 12, height = 12)
+  plot_module_ego_asthma(
+    focal_module       = mod,
+    df12               = merged_df,
+    geneset_categories = geneset_categories
+  )
+  dev.off()
+}
+```
+
+
 
 
 
@@ -4610,4 +5193,223 @@ merged_sub$decision <- result_sub$decision
 
 merged_sub[merged_sub$decision == 1, ]
 ```
+```{r}
+x<-merged[merged$decision==1,]
+length(unique(x$module))
+table(x$module)
+```
+
+### NTC
+
+
+```{r}
+library(data.table)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(heavytailcombtest)
+
+# -----------------------------
+# 0) Read inputs
+# -----------------------------
+df <- fread("/project/xuanyao/jiaming/Getting_started/data/geneset_to_trait/asthma/asthma.tsv")
+df2 <- df[grepl("M1.01", df$Name), ]
+
+Nadig_associated_perturbation <- rownames(snp_geneset_p_value_control)
+
+
+
+discovery_pairs_cis <- readRDS("/project/xuanyao/jiaming/Getting_started/data/CDT4/standard_input_format_asthma/flames+200kb/discovery_pairs_cis.rds")
+
+
+ gene_modules_id <- readRDS("/project/xuanyao/jiaming/Getting_started/data/CDT4/topic_geneset/flames+200kb/de_50_0.01_2_0.5.rds")
+
+
+
+
+# -----------------------------
+# 1) Build pv_map from df2
+# -----------------------------
+gene_id <- str_extract(df2$Name, "^[^(]+")
+
+lookup <- df2 %>%
+  mutate(ID = gene_id) %>%
+  filter(!is.na(ID), !is.na(p_value)) %>%
+  group_by(ID) %>%
+  summarise(p_value = min(p_value), .groups = "drop")
+
+pv_map <- setNames(lookup$p_value, lookup$ID)
+
+
+# -----------------------------
+# 2) Helpers
+# -----------------------------
+clean_p <- function(p) {
+  p <- as.numeric(p)
+  p[is.na(p) | p <= 0] <- NA
+  p
+}
+
+safe_comb <- function(p) {
+  p <- as.numeric(p)
+  p <- p[!is.na(p) & p > 0 & p <= 1]
+  if (length(p) == 0) return(NA_real_)
+  if (length(p) == 1) return(p)
+
+  combination.test(
+    p,
+    weights = NA,
+    method = "Cauchy",
+    tail.idx = 1
+  )
+}
+
+safe_comb_fisher <- function(p) {
+  p <- as.numeric(p)
+  p <- p[!is.na(p) & p > 0 & p <= 1]
+  if (length(p) == 0) return(NA_real_)
+  if (length(p) == 1) return(p)
+
+  stat <- -2 * sum(log(p))
+  stats::pchisq(stat, df = 2 * length(p), lower.tail = FALSE)
+}
+
+
+# -----------------------------
+# 3) Make filtered modules per perturbation (and record n_removed)
+# -----------------------------
+make_filtered_modules <- function(gene_symbol, gene_modules_id, pairs_df) {
+  target_name <- gene_symbol
+
+  ids_to_remove <- unique(pairs_df$response_id[pairs_df$grna_target == target_name])
+
+  filtered_modules <- lapply(gene_modules_id, function(mod_ids) {
+    setdiff(mod_ids, ids_to_remove)
+  })
+
+  list(
+    modules   = filtered_modules,
+    n_removed = length(ids_to_remove)
+  )
+}
+
+filtered_by_perturbation <- setNames(
+  lapply(
+    Nadig_associated_perturbation,
+    make_filtered_modules,
+    gene_modules_id = gene_modules_id,
+    pairs_df = discovery_pairs_cis
+  ),
+  Nadig_associated_perturbation
+)
+
+
+# -----------------------------
+# 4) Compute module-level combined p-values per perturbation
+#    (and add n_removed into module_results)
+# -----------------------------
+compute_for_one_pert <- function(pert) {
+  obj <- filtered_by_perturbation[[pert]]
+  gene_modules_id_pert <- obj$modules
+  n_removed <- obj$n_removed
+
+  # module -> p-values vector under this perturbation
+  module_pvals <- lapply(gene_modules_id_pert, function(genes) {
+    p <- pv_map[genes]
+    names(p) <- genes
+    p[!is.na(p)]
+  })
+
+  # combine within each module
+  p_acat <- map_dbl(module_pvals, ~ {
+    p <- clean_p(.x)
+    if (!length(p)) return(NA_real_)
+    as.numeric(safe_comb(p))
+  })
+
+  p_fisher <- map_dbl(module_pvals, ~ {
+    p <- clean_p(.x)
+    if (!length(p)) return(NA_real_)
+    as.numeric(safe_comb_fisher(p))
+  })
+
+  tibble(
+    snp       = pert,
+    n_removed = n_removed,  # ✅ 每个 perturbation 的 ids_to_remove 数量（复制到每一行 module）
+    module    = names(module_pvals),
+    n_genes   = lengths(gene_modules_id_pert),
+    n_matched = sapply(module_pvals, function(v) sum(!is.na(v))),
+    p_acat    = p_acat,
+    p_fisher  = p_fisher
+  )
+}
+
+module_results <- map_dfr(Nadig_associated_perturbation, compute_for_one_pert)
+
+# 查看结果
+module_results %>%
+  arrange(p_fisher) %>%
+  print(n = 10)
+
+
+library(tidyr)
+library(dplyr)
+library(tibble)
+
+snp_geneset_p_value<-  readRDS("/project/xuanyao/jiaming/paper/output/snake/CDT4_asthma/flames+200kb/K50/3000_t_ACAT_resample/p_values/geneset_p_value.rds")
+snp_geneset_p_value_test <- snp_geneset_p_value[which(!grepl("NTC-",rownames(snp_geneset_p_value))),]
+snp_geneset_p_value_control <- snp_geneset_p_value[which(grepl("NTC-",rownames(snp_geneset_p_value))),]
+
+df1_long <- snp_geneset_p_value_control %>%
+  as.data.frame() %>%
+  rownames_to_column("snp") %>%      # 这里真正把 rownames 变成一列 snp
+  pivot_longer(
+    -snp,
+    names_to  = "module",
+    values_to = "p_snp_geneset"
+  )
+
+## 2. 模块层面的表，只保留需要的列
+df2 <- module_results %>%
+  dplyr::select(module, p_fisher,snp)
+
+## 3. 按 module 合并，再调整列顺序
+merged <- df1_long %>%
+  left_join(df2, by = c("snp", "module")) %>%  # 关键改动
+  relocate(snp, module, p_snp_geneset, p_fisher)%>% tidyr::drop_na()
+
+
+# library(dplyr)
+# 
+# df1 <- as.data.frame(snp_geneset_p_value)
+# df1$snp <- rownames(df1)
+# 
+# df1_long <- df1 %>%
+#   pivot_longer(-snp, names_to = "module", values_to = "p_snp_geneset")
+# 
+# ## 图二：geneset_acat_pvals_M1.0001（列：module, p_acat）
+# df2 <- geneset_acat_pvals_M1.0001 %>%
+#   dplyr::select(module, p_fisher)
+# 
+# merged <- df1_long %>%
+#   left_join(df2, by = "module") %>%
+#   relocate(snp, module, p_snp_geneset, p_fisher)
+# 
+# 
+
+library(adaFilter)
+
+module_sizes <- lengths(gene_modules_id)
+merged <- merged %>% filter(module_sizes[module] > 1)
+
+X <- merged[,c(3,4)]
+result <- adaFilter(X, r = 2,alpha=0.15)
+
+merged$decision <- result$decision
+colnames(merged)[c(3,4)] <- c("snp_geneset","geneset_trait")
+
+merged[merged$decision==1,]
+```
+
+
 
