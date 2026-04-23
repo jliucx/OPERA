@@ -514,7 +514,7 @@ get_de_genes <- function(de, k,
 
 
 
-de <-  readRDS("/project/xuanyao/jiaming/Getting_started/data/CDT4/topic_model/flames+200kb/de_40.rds")
+de <-  readRDS("/project/xuanyao/jiaming/Getting_started/data/CDT4/topic_model/flames+200kb/de_50_iter1000.rds")
 
 
 
@@ -970,6 +970,39 @@ merged_df <- tbl %>%
 
 head(merged_df)
 ```
+
+```{r}
+merged_df %>%
+  left_join(
+    merged_df %>%
+      group_by(merged_gene_name) %>%
+      summarise(n_modules_regulated = n_distinct(module)),
+    by = "merged_gene_name"
+  ) %>%
+  dplyr::select(module, merged_gene_name, n_modules_regulated) %>%
+  distinct() %>%
+  arrange(module, desc(n_modules_regulated))
+
+merged_df %>%
+  left_join(
+    merged_df %>%
+      group_by(merged_gene_name) %>%
+      summarise(n_modules_regulated = n_distinct(module)),
+    by = "merged_gene_name"
+  ) %>%
+  dplyr::select(module, merged_gene_name, n_modules_regulated) %>%
+  distinct() %>%
+  group_by(module) %>%
+  summarise(
+    total_genes = n(),
+    genes_ge10 = sum(n_modules_regulated >= 10),
+    proportion = genes_ge10 / total_genes
+  ) %>%
+  arrange(desc(proportion))
+```
+
+
+
 
 ### Go term of 21 significant genesets
 
@@ -1592,6 +1625,10 @@ plot_gene_module_network_MCH(
  unclassified_alpha =0.3
 )
 ```
+
+
+
+
 
 ```{r erythroid-spec-network, fig.width=30, fig.height=30}
 target_genes  <- c("KLF1", "TAL1", "GFI1B", "ZFPM1", "MYB", "LDB1", "NFE2")
@@ -3851,7 +3888,7 @@ X <- merged[,c(3,4)]
 
 library(adaFilter)
 
-result <- adaFilter(X, r = 2,alpha=0.1)
+result <- adaFilter(X, r = 2,alpha=0.2)
 
 merged$decision <- result$decision
 colnames(merged)[c(3,4)] <- c("snp_geneset","geneset_trait")
@@ -4320,7 +4357,7 @@ X <- merged[,c(3,4)]
 
 library(adaFilter)
 
-result <- adaFilter(X, r = 2,alpha=0.1)
+result <- adaFilter(X, r = 2,alpha=0.2)
 
 merged$decision <- result$decision
 colnames(merged)[c(3,4)] <- c("snp_geneset","geneset_trait")
@@ -4425,7 +4462,7 @@ plot_gene_module_network2(
 
 ```{r}
 library(gprofiler2)
- gene_modules_id <- readRDS("/project/xuanyao/jiaming/Getting_started/data/CDT4/topic_geneset/flames+200kb/de_50_0.01_2_0.5.rds")
+ gene_modules_id <- readRDS("/project/xuanyao/jiaming/Getting_started/data/CDT4/topic_geneset/flames+200kb/de_50_0.01_2_0.5_iter1000.rds")
 
  de_10_0.01_2_0.5 <-gene_modules_id
 
@@ -4521,8 +4558,9 @@ saveWorkbook(wb, "/project/xuanyao/jiaming/paper/GO_terms_pvalue_athma_CD4_k50.x
 ```
 
 ```{r,eval=F}
-## K20
-top10_names[11,2][[1]]
+## K49
+top10_names[40,2][[1]]
+
 ```
 ```{r,eval=F}
 top10_names[37,2][[1]]
@@ -4550,7 +4588,7 @@ Nadig_associated_perturbation <- readRDS("/project/xuanyao/jiaming/Getting_start
 discovery_pairs_cis <- readRDS("/project/xuanyao/jiaming/Getting_started/data/CDT4/standard_input_format_asthma/flames+200kb/discovery_pairs_cis.rds")
 
 
- gene_modules_id <- readRDS("/project/xuanyao/jiaming/Getting_started/data/CDT4/topic_geneset/flames+200kb/de_50_0.01_2_0.5.rds")
+ gene_modules_id <- readRDS("/project/xuanyao/jiaming/Getting_started/data/CDT4/topic_geneset/flames+200kb/de_50_0.01_2_0.5_iter1000.rds")
 
 # gene_modules_id<-filtered_list_2
 
@@ -4682,12 +4720,13 @@ module_results %>%
 ```
 
 
+
 ```{r}
 library(tidyr)
 library(dplyr)
 library(tibble)
 
-snp_geneset_p_value<-  readRDS("/project/xuanyao/jiaming/paper/output/snake/CDT4_asthma/flames+200kb/K50_optimized/3000_t_ACAT_resample/p_values/geneset_p_value.rds")
+snp_geneset_p_value<-  readRDS("/project/xuanyao/jiaming/paper/output/snake/CDT4_asthma/flames+200kb/K50_iter1000/3000_t_ACAT_resample/p_values/geneset_p_value.rds")
 snp_geneset_p_value_test <- snp_geneset_p_value[which(!grepl("NTC-",rownames(snp_geneset_p_value))),]
 snp_geneset_p_value_control <- snp_geneset_p_value[which(grepl("NTC-",rownames(snp_geneset_p_value))),]
 
@@ -4734,12 +4773,25 @@ module_sizes <- lengths(gene_modules_id)
 merged <- merged %>% filter(module_sizes[module] > 1)
 
 X <- merged[,c(3,4)]
-result <- adaFilter(X, r = 2,alpha=0.15)
+result <- adaFilter(X, r = 2,alpha=0.2)
 
 merged$decision <- result$decision
 colnames(merged)[c(3,4)] <- c("snp_geneset","geneset_trait")
 
-dfl2<-merged[merged$decision==1,]
+dfl2_0.2<-merged[merged$decision==1,]
+
+merged <- df1_long %>%
+  left_join(df2, by = c("snp", "module")) %>%  # 关键改动
+  relocate(snp, module, p_snp_geneset, p_fisher)%>% tidyr::drop_na()
+merged <- merged %>% filter(module_sizes[module] > 1)
+
+X <- merged[,c(3,4)]
+result <- adaFilter(X, r = 2,alpha=0.1)
+
+merged$decision <- result$decision
+colnames(merged)[c(3,4)] <- c("snp_geneset","geneset_trait")
+
+dfl2_0.1<-merged[merged$decision==1,]
 ```
 
 
@@ -4780,7 +4832,7 @@ symbol_to_rsid <- gwas_result %>%
   dplyr::select(symbol, rsid) %>%
   distinct()
 
-tbl <- dfl2 %>%
+tbl_0.1 <- dfl2_0.1 %>%
   mutate(symbol = snp) %>%
   # many-to-many is expected: one gene can be near multiple GWAS loci (multiple rsids),
   # and the same gene can appear in multiple modules. Rows are collapsed in step 4
@@ -4795,7 +4847,7 @@ tbl <- dfl2 %>%
 #    e.g. gene1↔cluster_A, gene1↔cluster_B  →  gene1 + all genes in cluster_B form one row.
 library(igraph)
 
-merged_df <- tbl %>%
+merged_df_0.1 <- tbl_0.1 %>%
   group_by(module) %>%
   group_modify(function(df, key) {
     # Build bipartite edges: gene node  <->  cluster node
@@ -4836,7 +4888,65 @@ merged_df <- tbl %>%
   ) %>%
   dplyr::select(module, merged_gene_name, merged_loci, summary)
 
-head(merged_df)
+head(merged_df_0.1)
+
+tbl_0.2 <- dfl2_0.2 %>%
+  mutate(symbol = snp) %>%
+  # many-to-many is expected: one gene can be near multiple GWAS loci (multiple rsids),
+  # and the same gene can appear in multiple modules. Rows are collapsed in step 4
+  # by group_by(module, cluster_id).
+  left_join(symbol_to_rsid, by = "symbol", relationship = "many-to-many") %>%
+  left_join(rsid_locations %>% dplyr::select(rsid, cluster_id), by = "rsid") %>%
+  mutate(cluster_id = ifelse(is.na(cluster_id), paste0("solo_", ensg), cluster_id))
+
+# 4. Within each module, find connected components of a gene–cluster bipartite graph.
+#    Two genes (or two clusters) end up in the same component if they are bridged by a
+#    shared gene or a shared cluster anywhere in the chain — enabling transitive merging.
+#    e.g. gene1↔cluster_A, gene1↔cluster_B  →  gene1 + all genes in cluster_B form one row.
+library(igraph)
+
+merged_df_0.2 <- tbl_0.2 %>%
+  group_by(module) %>%
+  group_modify(function(df, key) {
+    # Build bipartite edges: gene node  <->  cluster node
+    # Use ENSG as fallback node label when symbol is missing
+    edges <- df %>%
+      transmute(
+        gene_node    = paste0("g:", ifelse(!is.na(symbol), symbol, ensg)),
+        cluster_node = paste0("c:", cluster_id)
+      ) %>%
+      distinct()
+
+    g    <- igraph::graph_from_data_frame(edges, directed = FALSE)
+    comp <- igraph::components(g)$membership          # named vector: node -> comp_id
+
+    # Map each row back to its component via the cluster node
+    node_comp <- tibble(node = names(comp), comp_id = as.integer(comp))
+
+    df %>%
+      left_join(
+        node_comp %>%
+          filter(startsWith(node, "c:")) %>%
+          transmute(cluster_id = sub("^c:", "", node), comp_id),
+        by = "cluster_id"
+      ) %>%
+      group_by(comp_id) %>%
+      summarise(
+        snp_geneset      = min(snp_geneset,   na.rm = TRUE),
+        geneset_trait    = min(geneset_trait, na.rm = TRUE),
+        merged_gene_name = paste(sort(unique(symbol[!is.na(symbol)])), collapse = "-"),
+        merged_loci      = paste(sort(unique(rsid[!is.na(rsid)])),     collapse = "-"),
+        .groups = "drop"
+      ) %>%
+      dplyr::select(-comp_id)
+  }) %>%
+  ungroup() %>%
+  mutate(
+    summary = paste0(merged_gene_name, "(", merged_loci, ")")
+  ) %>%
+  dplyr::select(module, merged_gene_name, merged_loci, summary)
+
+head(merged_df_0.2)
 ```
 
 
@@ -4859,8 +4969,16 @@ plot_gene_module_network_asthma <- function(df12,
 
   if (is.null(layout_fun)) layout_fun <- igraph::layout_with_fr
 
-  node_gene_col   <- "#AED6F1"   # light blue  – peripheral gene/locus nodes
-  node_module_col <- "#D5D8DC"   # light grey  – module nodes
+  node_gene_col      <- "#AED6F1"   # light blue  – peripheral gene/locus nodes
+  node_module_col    <- "#D5D8DC"   # light grey  – module nodes
+  node_highlight_col <- "#E74C3C"   # red         – asthma GWAS genes
+
+  asthma_gwas_genes <- unique(c(
+  "BACH2", "IRF1", "GATA3", "HDAC7", "RPS26", "NAB2", "ZBTB10", "IL13", "D2HGDH", "PTPRC",
+  "SMAD3", "TNFSF4", "PRKCQ", "CXCR5", "ARRDC1", "SERPINB7", "CCL20", "LRRC32", "IL2RA", "IL33", "TBX21",
+  "TNFRSF11A", "RANBP6", "CCR4", "OVOL1", "CEBPA", "STAT6", "ID2", "CCR7", "TSLP", "TLR10",
+  "LPP", "MAP2K5", "TLR1", "IL1RL1", "FLG", "OTULINL", "SLC7A10", "IL4R", "SMARCE1"
+))
 
   # ── data ─────────────────────────────────────────────────────────────────────
   d <- df12 %>%
@@ -4922,6 +5040,12 @@ plot_gene_module_network_asthma <- function(df12,
   mod_ids  <- which(igraph::V(g)$type == "module")
   gene_ids <- which(igraph::V(g)$type == "gene")
 
+  # highlight peripheral genes that match any component of hyphen-joined names
+  is_highlighted <- vapply(igraph::V(g)$name[gene_ids], function(nm) {
+    any(strsplit(nm, "-")[[1]] %in% asthma_gwas_genes)
+  }, logical(1))
+  igraph::V(g)$color[gene_ids[is_highlighted]] <- node_highlight_col
+
   igraph::V(g)$size <- rep(NA_real_, igraph::vcount(g))
 
   mod_w  <- igraph::V(g)$weight[mod_ids]
@@ -4946,6 +5070,21 @@ plot_gene_module_network_asthma <- function(df12,
   if (label_modules) igraph::V(g)$label[mod_ids]  <- igraph::V(g)$name[mod_ids]
   if (label_genes)   igraph::V(g)$label[gene_ids] <- igraph::V(g)$name[gene_ids]
 
+  # ── tested / replicated counts ───────────────────────────────────────────────
+  nadig_perturbations <- readRDS("/project/xuanyao/jiaming/Getting_started/data/GWAS/asthma/GCST010043/flames+200kb/CDT4_associated_perturbation.rds")
+  n_tested     <- length(intersect(nadig_perturbations, asthma_gwas_genes))
+  highlighted_names   <- igraph::V(g)$name[gene_ids[is_highlighted]]
+  replicated_genes <- Filter(function(ag) {
+    any(vapply(highlighted_names, function(nm) ag %in% strsplit(nm, "-")[[1]], logical(1)))
+  }, asthma_gwas_genes)
+  n_replicated <- length(replicated_genes)
+  annot_text <- paste0(
+    "Ethan Zhong's asthma genes: ", length(asthma_gwas_genes), "\n",
+    "Tested: ", n_tested, "\n",
+    "Proportion replicated: ", n_replicated, "/", n_tested,
+    " (", sprintf("%.1f%%", 100 * n_replicated / n_tested), ")"
+  )
+
   lay <- layout_fun(g)
   if (!is.null(out_pdf)) grDevices::pdf(out_pdf, width = width, height = height)
   plot(g, layout = lay, vertex.label.dist = 0, edge.curved = 0)
@@ -4953,16 +5092,20 @@ plot_gene_module_network_asthma <- function(df12,
   usr    <- graphics::par("usr")
   x_left <- usr[1] + 0.02 * (usr[2] - usr[1])
   y_bot  <- usr[3] + 0.02 * (usr[4] - usr[3])
+  x_right <- usr[2] - 0.02 * (usr[2] - usr[1])
+  y_top   <- usr[4] - 0.02 * (usr[4] - usr[3])
   graphics::legend(
     x = x_left, y = y_bot, xjust = 0, yjust = 0,
-    legend = c("Module", "Gene/locus"),
-    pt.bg  = c(node_module_col, node_gene_col),
-    col    = c(node_module_col, node_gene_col),
-    pch    = c(15, 19),
+    legend = c("Module", "Gene/locus", "Asthma GWAS gene"),
+    pt.bg  = c(node_module_col, node_gene_col, node_highlight_col),
+    col    = c(node_module_col, node_gene_col, node_highlight_col),
+    pch    = c(15, 19, 19),
     pt.cex = 2,
     cex    = 1.1,
     bty    = "o", box.col = "grey30", bg = "white"
   )
+  graphics::text(x = x_right, y = y_top, labels = annot_text,
+                 adj = c(1, 1), cex = 1.0, col = "black")
 
   if (!is.null(out_pdf)) grDevices::dev.off()
   invisible(g)
@@ -5128,76 +5271,19 @@ plot_module_ego_asthma <- function(focal_module,
 
 ```{r plot-asthma-network, fig.width=20, fig.height=20}
 plot_gene_module_network_asthma(
-  df12      = merged_df,
+  df12      = merged_df_0.1,
+  top_n_gene = 800
+)
+
+plot_gene_module_network_asthma(
+  df12      = merged_df_0.2,
   top_n_gene = 800
 )
 ```
 
-```{r}
-library(readxl)
-geneset_categories <- read_excel("/project/xuanyao/jiaming/paper/output/mediation_analysis/asthma/K50/geneset_categories.xlsx")
-```
-
-
-```{r plot-asthma-ego, fig.width=12, fig.height=12}
-setwd("/project/xuanyao/jiaming/paper/output/mediation_analysis/asthma/K50")
-for (mod in sort(unique(merged_df$module))) {
-  plot_module_ego_asthma(
-    focal_module       = mod,
-    df12               = merged_df,
-    geneset_categories = geneset_categories
-  )
-  pdf(paste0("asthma_ego_", mod, ".pdf"), width = 12, height = 12)
-  plot_module_ego_asthma(
-    focal_module       = mod,
-    df12               = merged_df,
-    geneset_categories = geneset_categories
-  )
-  dev.off()
-}
-```
 
 
 
-
-
-### modules most related to asthma
-
-```{r}
-target_modules <- c("k9", "k20", "k24", "k25", "k28", "k32", "k35")
-
-merged_sub <- merged %>% filter(module %in% target_modules)
-
-X_sub <- merged_sub[, c("snp_geneset", "geneset_trait")]
-result_sub <- adaFilter(X_sub, r = 2, alpha = 0.1)
-
-merged_sub$decision <- result_sub$decision
-
-merged_sub[merged_sub$decision == 1, ]
-```
-
-### modules related to immune
-
-```{r}
-target_modules <- c(  "k5", "k7", "k8", "k9", "k10", "k12", "k13",
-  "k20", "k21", "k24", "k25", "k26", "k28",
-  "k32", "k33", "k34", "k35", "k40", "k42",
-  "k46", "k47")
-
-merged_sub <- merged %>% filter(module %in% target_modules)
-
-X_sub <- merged_sub[, c("snp_geneset", "geneset_trait")]
-result_sub <- adaFilter(X_sub, r = 2, alpha = 0.1)
-
-merged_sub$decision <- result_sub$decision
-
-merged_sub[merged_sub$decision == 1, ]
-```
-```{r}
-x<-merged[merged$decision==1,]
-length(unique(x$module))
-table(x$module)
-```
 
 ### NTC
 
